@@ -307,4 +307,4 @@ def solve_hcaptcha(page, timeout=180):
             _fill_first(ch, ["#audio-response", "textarea", "input[type=text]"], text)
             _click_first(ch, ["#voice-submit", ".button-submit", "button[type=submit]"])
             time.sleep(4)
-        fr = _frames(page, "hcapt
+        fr = _frames(page,\u201chcaptcha.com\u201d,\"checkbox\")\n"
