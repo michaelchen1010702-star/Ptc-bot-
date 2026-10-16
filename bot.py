@@ -308,3 +308,228 @@ def solve_hcaptcha(page, timeout=180):
             _click_first(ch, ["#voice-submit", ".button-submit", "button[type=submit]"])
             time.sleep(4)
         fr = _frames(page, "hcaptcha.com", "checkbox")
+if fr:
+            try:
+                el = fr.query_selector("#checkbox")
+                if el and el.get_attribute("aria-checked") == "true":
+                    return True
+            except Exception:
+                pass
+    raise CaptchaFail("hcaptcha failed")
+
+
+def solve_any(page, wait=8):
+    end = time.time() + wait
+    while time.time() < end:
+        if _frames(page, "recaptcha/api2/anchor"):
+            return solve_recaptcha(page)
+        if _frames(page, "hcaptcha.com"):
+            return solve_hcaptcha(page)
+        time.sleep(0.5)
+    return True
+
+
+def fill_label(page, label, value):
+    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
+          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
+    for sel in [f'xpath=//label[{xp}]/following::input[1]',
+                f'input[name="{label.lower()}"]',
+                f'input[id*="{label.lower()}"]',
+                f'input[placeholder*="{label}" i]']:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                el.fill(value)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def set_select(page, label, value, index_fallback=None):
+    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
+          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
+    sels = [f'xpath=//label[{xp}]/following::select[1]',
+            f'xpath=//*[self::label or self::span or self::div][{xp}]/following::select[1]',
+            f'select[name*="{label.lower()}" i]',
+            f'select[id*="{label.lower()}" i]',
+            f'select[aria-label*="{label}" i]']
+    for sel in sels:
+        try:
+            el = page.query_selector(sel)
+            if not el:
+                continue
+            try:
+                el.select_option(label=value)
+            except Exception:
+                try:
+                    el.select_option(value=value)
+                except Exception:
+                    if index_fallback is None:
+                        continue
+                    el.select_option(index=index_fallback)
+            print(f"  set {label} = {value}")
+            return True
+        except Exception:
+            continue
+    print(f"  FAILED to set {label}")
+    return False
+
+
+def check_label(page, label):
+    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
+          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
+    try:
+        el = page.query_selector(f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
+        if el and not el.is_checked():
+            el.check()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def push(row):
+    if not SHEETS_URL:
+        print("  sheet: no SHEETS_URL")
+        return
+    try:
+        r = requests.post(SHEETS_URL, json={"token": SHEETS_TOKEN, "accounts": [row]},
+                          allow_redirects=True, timeout=30)
+        print("  sheet:", r.text[:50])
+    except Exception as e:
+        print("  sheet error:", e)
+
+
+def one_account(page, acc):
+    print("  goto:", SIGNUP_URL)
+    try:
+        page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
+    except Exception as e:
+        print("  goto failed:", e)
+    time.sleep(8)
+    print("  landed on:", page.url)
+    print("  title:", page.title())
+    snap(page, f"{acc['username']}_1_landed")
+
+    if not wait_for_form(page, 45):
+        snap(page, f"{acc['username']}_2_noform")
+        dump_fields(page, "noform")
+        return False
+
+    snap(page, f"{acc['username']}_3_step1")
+    dump_fields(page, "step1")
+    dump_select_options(page)
+
+    set_select(page, "country", COUNTRY)
+    set_select(page, "year", str(DOB_YEAR))
+    set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
+    set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
+    time.sleep(2)
+    snap(page, f"{acc['username']}_4_birthdate_filled")
+
+    click_next(page)
+    time.sleep(6)
+    print("  after step1 url:", page.url)
+    snap(page, f"{acc['username']}_5_step2")
+    dump_fields(page, "step2")
+
+    if not wait_for_form(page, 40):
+        print("  no step 2 appeared")
+        return False
+
+    r = {}
+    r["username"] = fill_label(page, "username", acc["username"])
+    r["password"] = fill_label(page, "password", acc["password"])
+    r["email"]    = fill_label(page, "email", acc["email"])
+    r["confirm"]  = fill_label(page, "confirm", acc["email"])
+    r["agree"]    = check_label(page, "agree")
+    r["terms"]    = check_label(page, "terms")
+    r["news"]     = check_label(page, "news")
+    print("  filled:", r)
+
+    try:
+        solve_any(page)
+    except CaptchaFail as e:
+        print("  captcha fail:", e)
+
+    snap(page, f"{acc['username']}_6_step2_filled")
+    click_next(page)
+    time.sleep(7)
+    print("  after step2 url:", page.url)
+    snap(page, f"{acc['username']}_7_step3")
+    dump_fields(page, "step3")
+
+    for n in range(4, 8):
+        if not wait_for_form(page, 20):
+            break
+        print(f"  --- extra step {n} ---")
+        dump_fields(page, f"step{n}")
+        fill_label(page, "username", acc["username"])
+        fill_label(page, "password", acc["password"])
+        fill_label(page, "email", acc["email"])
+        fill_label(page, "confirm", acc["email"])
+        check_label(page, "agree")
+        check_label(page, "terms")
+        try:
+            solve_any(page)
+        except CaptchaFail:
+            pass
+        snap(page, f"{acc['username']}_x{n}_filled")
+        if not click_next(page):
+            break
+        time.sleep(6)
+        print(f"  after step{n} url:", page.url)
+
+    body = page.content().lower()
+    for bad in ("already taken", "already exists", "not available", "invalid",
+                "required", "error", "captcha", "verify"):
+        if bad in body:
+            print(f"  page mentions: {bad}")
+
+    print("  waiting for email...")
+    link = wait_for_link(acc["email"], acc["mail_token"], timeout=180)
+    if not link:
+        print("  no email")
+        return False
+    print("  link:", link[:80])
+    page.goto(link, wait_until="domcontentloaded", timeout=90000)
+    time.sleep(3)
+    print("  activated")
+    return True
+
+
+def main():
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = browser.new_context(user_agent=UA, viewport={"width": 1366, "height": 900})
+        page = ctx.new_page()
+
+        for i in range(COUNT):
+            print(f"[{i+1}/{COUNT}] start")
+            acc = {"username": random_username(), "password": random_password()}
+            acc["email"], acc["mail_token"] = create_inbox()
+            print("  email:", acc["email"])
+            try:
+                acc["status"] = "ok" if one_account(page, acc) else "failed"
+            except PWTimeout as e:
+                print("  timeout:", e); acc["status"] = "timeout"
+            except Exception as e:
+                print("  error:", repr(e)); acc["status"] = "error"
+
+            results.append(acc)
+            push({k: acc[k] for k in ("username", "password", "email", "status")})
+            with open(OUT, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
+                                   extrasaction="ignore")
+                w.writeheader(); w.writerows(results)
+            print(f"  -> {acc['username']} [{acc['status']}]")
+            time.sleep(PAUSE)
+
+        browser.close()
+    print("done:", OUT)
+
+
+if __name__ == "__main__":
+    main()
