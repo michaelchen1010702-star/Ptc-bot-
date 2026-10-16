@@ -308,14 +308,14 @@ def solve_hcaptcha(page, timeout=180):
             _click_first(ch, ["#voice-submit", ".button-submit", "button[type=submit]"])
             time.sleep(4)
         fr = _frames(page, "hcaptcha.com", "checkbox")
-if fr:
+        if fr:
             try:
                 el = fr.query_selector("#checkbox")
                 if el and el.get_attribute("aria-checked") == "true":
                     return True
             except Exception:
                 pass
-    
+    raise CaptchaFail("hcaptcha failed")
 
 
 def solve_any(page, wait=8):
