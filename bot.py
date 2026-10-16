@@ -10,6 +10,7 @@ DOB_YEAR, DOB_MONTH, DOB_DAY = 1990, 1, 1
 COUNT      = int(os.getenv("COUNT", "1"))
 PAUSE      = 8
 OUT        = "accounts.csv"
+DBG        = "debug"
 
 SHEETS_URL   = os.getenv("SHEETS_URL", "")
 SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
@@ -19,6 +20,17 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 WORDS = ["ash","misty","brock","pika","gengar","eevee","snorlax","gyara",
          "dragon","mewtwo","lapras","zapdos","onix","psy","golem","machop"]
+
+os.makedirs(DBG, exist_ok=True)
+
+def snap(page, name):
+    try:
+        page.screenshot(path=f"{DBG}/{name}.png", full_page=True)
+        with open(f"{DBG}/{name}.html", "w") as f:
+            f.write(page.content())
+        print(f"  [snap] {name}  url={page.url}")
+    except Exception as e:
+        print("  snap failed:", e)
 
 # ------------------------------------------------------------ account gen
 def random_username():
@@ -48,20 +60,27 @@ def create_inbox():
 def wait_for_link(addr, tok, timeout=240):
     h = {"Authorization": f"Bearer {tok}"}
     end = time.time() + timeout
+    seen = 0
     while time.time() < end:
         r = requests.get(f"{MAIL}/messages", headers=h)
         if r.status_code == 200:
-            for m in r.json().get("hydra:member", []):
+            msgs = r.json().get("hydra:member", [])
+            if len(msgs) != seen:
+                seen = len(msgs)
+                print(f"    inbox has {seen} message(s):",
+                      [m.get("from", {}).get("address") for m in msgs])
+            for m in msgs:
                 frm = (m.get("from") or {}).get("address", "").lower()
-                if "pokemon" in frm:
-                    full = requests.get(f"{MAIL}/messages/{m['id']}", headers=h).json()
-                    html = full.get("html") or []
-                    body = " ".join(html) if isinstance(html, list) else str(html)
-                    body += " " + (full.get("text") or "")
-                    links = re.findall(r'https?://[^\s"\'<>)]+', body)
-                    hit = next((l for l in links if "pokemon" in l), None)
-                    if hit:
-                        return hit
+                subj = (m.get("subject") or "")[:60]
+                print(f"    msg from={frm} subj={subj}")
+                full = requests.get(f"{MAIL}/messages/{m['id']}", headers=h).json()
+                html = full.get("html") or []
+                body = " ".join(html) if isinstance(html, list) else str(html)
+                body += " " + (full.get("text") or "")
+                links = re.findall(r'https?://[^\s"\'<>)]+', body)
+                hit = next((l for l in links if "pokemon" in l), None)
+                if hit:
+                    return hit
         time.sleep(5)
     return None
 
@@ -276,8 +295,21 @@ def check_label(page, label):
         el = page.query_selector(f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
         if el and not el.is_checked():
             el.check()
+            return True
     except Exception:
         pass
+    return False
+
+def dump_fields(page):
+    print("  --- inputs on page ---")
+    for el in page.query_selector_all("input, select"):
+        try:
+            print("   ", el.evaluate("e => e.tagName"), 
+                  "name=", el.get_attribute("name"),
+                  "id=", el.get_attribute("id"),
+                  "type=", el.get_attribute("type"))
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------- sheets
 def push(row):
@@ -293,51 +325,80 @@ def push(row):
 
 # ------------------------------------------------------------------ main
 def one_account(page, acc):
+    print("  goto:", SIGNUP_URL)
     page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
-    time.sleep(4)
+    time.sleep(5)
+    print("  landed on:", page.url)
+    print("  title:", page.title())
+    snap(page, f"{acc['username']}_1_landed")
 
     if _frames(page, "hcaptcha.com"):
         print("  security check...")
-        solve_hcaptcha(page)
+        try:
+            solve_hcaptcha(page)
+        except CaptchaFail as e:
+            print("  captcha fail:", e)
+            snap(page, f"{acc['username']}_2_captchafail")
+            return False
         for _ in range(30):
             if not _frames(page, "hcaptcha.com"):
                 break
             time.sleep(1)
+        time.sleep(3)
+        print("  landed on:", page.url)
 
-    time.sleep(3)
-    fill_label(page, "country", COUNTRY)
-    fill_label(page, "month", str(DOB_MONTH).zfill(2))
-    fill_label(page, "day", str(DOB_DAY).zfill(2))
-    fill_label(page, "year", str(DOB_YEAR))
-    fill_label(page, "username", acc["username"])
-    fill_label(page, "password", acc["password"])
-    fill_label(page, "email", acc["email"])
-    fill_label(page, "confirm", acc["email"])
-    check_label(page, "agree")
-    check_label(page, "terms")
+    dump_fields(page)
 
-    solve_any(page)
+    results = {}
+    results["country"]  = fill_label(page, "country", COUNTRY)
+    results["month"]    = fill_label(page, "month", str(DOB_MONTH).zfill(2))
+    results["day"]      = fill_label(page, "day", str(DOB_DAY).zfill(2))
+    results["year"]     = fill_label(page, "year", str(DOB_YEAR))
+    results["username"] = fill_label(page, "username", acc["username"])
+    results["password"] = fill_label(page, "password", acc["password"])
+    results["email"]    = fill_label(page, "email", acc["email"])
+    results["confirm"]  = fill_label(page, "confirm", acc["email"])
+    results["agree"]    = check_label(page, "agree")
+    results["terms"]    = check_label(page, "terms")
+    print("  filled:", results)
 
+    snap(page, f"{acc['username']}_3_filled")
+
+    try:
+        solve_any(page)
+    except CaptchaFail as e:
+        print("  form captcha fail:", e)
+
+    clicked = None
     for sel in ['button:has-text("Sign Up")', 'button:has-text("Continue")',
-                'button[type="submit"]']:
+                'button:has-text("Submit")', 'button[type="submit"]',
+                'input[type="submit"]']:
         try:
             b = page.query_selector(sel)
             if b:
                 b.click()
+                clicked = sel
                 break
         except Exception:
             continue
+    print("  clicked:", clicked)
 
-    time.sleep(6)
-    if "already" in page.content().lower():
-        print("  already taken")
-        return False
+    time.sleep(8)
+    print("  after submit url:", page.url)
+    snap(page, f"{acc['username']}_4_submitted")
+
+    body = page.content().lower()
+    for bad in ("already taken", "already exists", "is not available", "invalid",
+                "required", "error"):
+        if bad in body:
+            print(f"  page mentions: {bad}")
 
     print("  waiting for email...")
-    link = wait_for_link(acc["email"], acc["mail_token"])
+    link = wait_for_link(acc["email"], acc["mail_token"], timeout=180)
     if not link:
         print("  no email")
         return False
+    print("  link:", link[:80])
     page.goto(link, wait_until="domcontentloaded", timeout=90000)
     time.sleep(3)
     print("  activated")
@@ -354,17 +415,19 @@ def main():
             print(f"[{i+1}/{COUNT}] start")
             acc = {"username": random_username(), "password": random_password()}
             acc["email"], acc["mail_token"] = create_inbox()
+            print("  email:", acc["email"])
             try:
                 acc["status"] = "ok" if one_account(page, acc) else "failed"
             except PWTimeout as e:
                 print("  timeout:", e); acc["status"] = "timeout"
             except Exception as e:
-                print("  error:", e); acc["status"] = "error"
+                print("  error:", repr(e)); acc["status"] = "error"
 
             results.append(acc)
             push({k: acc[k] for k in ("username", "password", "email", "status")})
             with open(OUT, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["username","password","email","status"])
+                w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
+                                   extrasaction="ignore")
                 w.writeheader(); w.writerows(results)
             print(f"  -> {acc['username']} [{acc['status']}]")
             time.sleep(PAUSE)
