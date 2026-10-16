@@ -4,9 +4,10 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ----------------------------------------------------------------- config
-SIGNUP_URL = "https://club.pokemon.com/us/pokemon-trainer-club/sign-up/"
+SIGNUP_URL = "https://join.pokemon.com/"
 COUNTRY    = "United States"
 DOB_YEAR, DOB_MONTH, DOB_DAY = 1990, 1, 1
+MONTH_NAME = "January"
 COUNT      = int(os.getenv("COUNT", "1"))
 PAUSE      = 8
 OUT        = "accounts.csv"
@@ -23,6 +24,7 @@ WORDS = ["ash","misty","brock","pika","gengar","eevee","snorlax","gyara",
 
 os.makedirs(DBG, exist_ok=True)
 
+# ------------------------------------------------------------- utilities
 def snap(page, name):
     try:
         page.screenshot(path=f"{DBG}/{name}.png", full_page=True)
@@ -31,6 +33,68 @@ def snap(page, name):
         print(f"  [snap] {name}  url={page.url}")
     except Exception as e:
         print("  snap failed:", e)
+
+def field_count(page):
+    try:
+        return len(page.query_selector_all("input, select"))
+    except Exception:
+        return 0
+
+def wait_for_form(page, timeout=60, minimum=1):
+    end = time.time() + timeout
+    while time.time() < end:
+        if field_count(page) >= minimum:
+            print(f"  form ready ({field_count(page)} fields)")
+            return True
+        time.sleep(1.5)
+    print("  form never appeared")
+    return False
+
+def click_next(page):
+    for txt in ["Continue", "Next", "Sign Up", "Sign up", "Create Account",
+                "Create account", "Submit", "Register"]:
+        for sel in [f'button:has-text("{txt}")', f'a:has-text("{txt}")',
+                    f'input[value*="{txt}"]']:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    print(f"  clicked: {txt}")
+                    el.click()
+                    time.sleep(5)
+                    return True
+            except Exception:
+                continue
+    try:
+        el = page.query_selector('button[type="submit"]')
+        if el:
+            print("  clicked: submit")
+            el.click()
+            time.sleep(5)
+            return True
+    except Exception:
+        pass
+    return False
+
+def dump_fields(page, tag=""):
+    print(f"  --- fields {tag} ---")
+    for el in page.query_selector_all("input, select, button"):
+        try:
+            t = el.evaluate("e => e.tagName.toLowerCase()")
+            txt = (el.inner_text() or "").strip()[:30]
+            print("   ", t, "name=", el.get_attribute("name"),
+                  "id=", el.get_attribute("id"),
+                  "type=", el.get_attribute("type"), "text=", txt)
+        except Exception:
+            pass
+
+def dump_select_options(page):
+    for el in page.query_selector_all("select"):
+        try:
+            opts = [o.inner_text().strip() for o in el.query_selector_all("option")][:8]
+            print("    select name=", el.get_attribute("name"),
+                  "id=", el.get_attribute("id"), "opts=", opts)
+        except Exception:
+            pass
 
 # ------------------------------------------------------------ account gen
 def random_username():
@@ -156,68 +220,6 @@ def _transcribe(data):
             try: os.unlink(p)
             except Exception: pass
 
-def solve_hcaptcha(page, timeout=180):
-    end = time.time() + timeout
-    for _ in range(25):
-        if time.time() > end:
-            raise CaptchaFail("hcaptcha box missing")
-        fr = _frames(page, "hcaptcha.com", "checkbox")
-        if fr:
-            if _click_first(fr, ["#checkbox", ".checkbox", "[role=checkbox]"]):
-                break
-            if _click_iframe_at(page, "checkbox"):
-                break
-        time.sleep(1)
-    print("    hcaptcha: clicked")
-
-    for _ in range(15):
-        fr = _frames(page, "hcaptcha.com", "checkbox")
-        if fr:
-            try:
-                el = fr.query_selector("#checkbox")
-                if el and (el.get_attribute("aria-checked") == "true"
-                           or "checked" in (el.get_attribute("class") or "")):
-                    print("    hcaptcha: passed on click")
-                    return True
-            except Exception:
-                pass
-        if _frames(page, "hcaptcha.com", "challenge"):
-            break
-        time.sleep(1)
-
-    print("    hcaptcha: audio fallback")
-    for _ in range(5):
-        if time.time() > end:
-            break
-        ch = _frames(page, "hcaptcha.com", "challenge")
-        if not ch:
-            time.sleep(2)
-            continue
-        _click_first(ch, ["#audio-button", "[aria-label*='audio' i]", ".audio-button"])
-        time.sleep(3)
-        data = _audio_bytes(ch)
-        if not data:
-            continue
-        try:
-            text = _transcribe(data)
-            print("    heard:", text)
-        except Exception as e:
-            print("    stt:", e)
-            text = ""
-        if text:
-            _fill_first(ch, ["#audio-response", "textarea", "input[type=text]"], text)
-            _click_first(ch, ["#voice-submit", ".button-submit", "button[type=submit]"])
-            time.sleep(4)
-        fr = _frames(page, "hcaptcha.com", "checkbox")
-        if fr:
-            try:
-                el = fr.query_selector("#checkbox")
-                if el and el.get_attribute("aria-checked") == "true":
-                    return True
-            except Exception:
-                pass
-    raise CaptchaFail("hcaptcha failed")
-
 def solve_recaptcha(page, timeout=180):
     end = time.time() + timeout
     anchor = None
@@ -255,184 +257,54 @@ def solve_recaptcha(page, timeout=180):
             return True
     raise CaptchaFail("recaptcha failed")
 
-def solve_any(page, wait=10):
-    end = time.time() + wait
-    while time.time() < end:
-        if _frames(page, "hcaptcha.com"):
-            return solve_hcaptcha(page)
-        if _frames(page, "recaptcha/api2"):
-            return solve_recaptcha(page)
-        time.sleep(0.5)
-    return True
-
-# ------------------------------------------------------------- form fill
-def fill_label(page, label, value):
-    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
-    for sel in [f'xpath=//label[{xp}]/following::input[1]',
-                f'xpath=//label[{xp}]/following::select[1]',
-                f'input[name="{label.lower()}"]',
-                f'input[placeholder*="{label}" i]']:
-        try:
-            el = page.query_selector(sel)
-            if not el:
-                continue
-            if el.evaluate("e => e.tagName.toLowerCase()") == "select":
-                try: el.select_option(label=value)
-                except Exception: el.select_option(value=value)
-            else:
-                el.fill(value)
-            return True
-        except Exception:
-            continue
-    return False
-
-def check_label(page, label):
-    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
-    try:
-        el = page.query_selector(f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
-        if el and not el.is_checked():
-            el.check()
-            return True
-    except Exception:
-        pass
-    return False
-
-def dump_fields(page):
-    print("  --- inputs found ---")
-    for el in page.query_selector_all("input, select"):
-        try:
-            print("   ", el.evaluate("e => e.tagName"),
-                  "name=", el.get_attribute("name"),
-                  "id=", el.get_attribute("id"),
-                  "type=", el.get_attribute("type"))
-        except Exception:
-            pass
-
-# ---------------------------------------------------------------- sheets
-def push(row):
-    if not SHEETS_URL:
-        print("  sheet: no SHEETS_URL")
-        return
-    try:
-        r = requests.post(SHEETS_URL, json={"token": SHEETS_TOKEN, "accounts": [row]},
-                          allow_redirects=True, timeout=30)
-        print("  sheet:", r.text[:50])
-    except Exception as e:
-        print("  sheet error:", e)
-
-# ------------------------------------------------------------------ main
-def one_account(page, acc):
-    print("  goto:", SIGNUP_URL)
-    page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
-    time.sleep(5)
-    print("  landed on:", page.url)
-    print("  title:", page.title())
-    snap(page, f"{acc['username']}_1_landed")
-
-    if _frames(page, "hcaptcha.com"):
-        print("  security check...")
-        try:
-            solve_hcaptcha(page)
-        except CaptchaFail as e:
-            print("  captcha fail:", e)
-            snap(page, f"{acc['username']}_2_captchafail")
-            return False
-        for _ in range(30):
-            if not _frames(page, "hcaptcha.com"):
+def solve_hcaptcha(page, timeout=180):
+    end = time.time() + timeout
+    for _ in range(25):
+        if time.time() > end:
+            raise CaptchaFail("hcaptcha box missing")
+        fr = _frames(page, "hcaptcha.com", "checkbox")
+        if fr:
+            if _click_first(fr, ["#checkbox", ".checkbox", "[role=checkbox]"]):
                 break
-            time.sleep(1)
-        time.sleep(3)
-        print("  landed on:", page.url)
-
-    dump_fields(page)
-
-    r = {}
-    r["country"]  = fill_label(page, "country", COUNTRY)
-    r["month"]    = fill_label(page, "month", str(DOB_MONTH).zfill(2))
-    r["day"]      = fill_label(page, "day", str(DOB_DAY).zfill(2))
-    r["year"]     = fill_label(page, "year", str(DOB_YEAR))
-    r["username"] = fill_label(page, "username", acc["username"])
-    r["password"] = fill_label(page, "password", acc["password"])
-    r["email"]    = fill_label(page, "email", acc["email"])
-    r["confirm"]  = fill_label(page, "confirm", acc["email"])
-    r["agree"]    = check_label(page, "agree")
-    r["terms"]    = check_label(page, "terms")
-    print("  filled:", r)
-
-    snap(page, f"{acc['username']}_3_filled")
-
-    try:
-        solve_any(page)
-    except CaptchaFail as e:
-        print("  form captcha fail:", e)
-
-    clicked = None
-    for sel in ['button:has-text("Sign Up")', 'button:has-text("Continue")',
-                'button:has-text("Submit")', 'button[type="submit"]',
-                'input[type="submit"]']:
-        try:
-            b = page.query_selector(sel)
-            if b:
-                b.click()
-                clicked = sel
+            if _click_iframe_at(page, "checkbox"):
                 break
-        except Exception:
-            continue
-    print("  clicked:", clicked)
-
-    time.sleep(8)
-    print("  after submit url:", page.url)
-    snap(page, f"{acc['username']}_4_submitted")
-
-    body = page.content().lower()
-    for bad in ("already taken", "already exists", "not available", "invalid",
-                "required", "error", "captcha"):
-        if bad in body:
-            print(f"  page mentions: {bad}")
-
-    print("  waiting for email...")
-    link = wait_for_link(acc["email"], acc["mail_token"], timeout=180)
-    if not link:
-        print("  no email")
-        return False
-    print("  link:", link[:80])
-    page.goto(link, wait_until="domcontentloaded", timeout=90000)
-    time.sleep(3)
-    print("  activated")
-    return True
-
-def main():
-    results = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(user_agent=UA)
-        page = ctx.new_page()
-
-        for i in range(COUNT):
-            print(f"[{i+1}/{COUNT}] start")
-            acc = {"username": random_username(), "password": random_password()}
-            acc["email"], acc["mail_token"] = create_inbox()
-            print("  email:", acc["email"])
+        time.sleep(1)
+    print("    hcaptcha: clicked")
+    for _ in range(15):
+        fr = _frames(page, "hcaptcha.com", "checkbox")
+        if fr:
             try:
-                acc["status"] = "ok" if one_account(page, acc) else "failed"
-            except PWTimeout as e:
-                print("  timeout:", e); acc["status"] = "timeout"
-            except Exception as e:
-                print("  error:", repr(e)); acc["status"] = "error"
-
-            results.append(acc)
-            push({k: acc[k] for k in ("username", "password", "email", "status")})
-            with open(OUT, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
-                                   extrasaction="ignore")
-                w.writeheader(); w.writerows(results)
-            print(f"  -> {acc['username']} [{acc['status']}]")
-            time.sleep(PAUSE)
-
-        browser.close()
-    print("done:", OUT)
-
-if __name__ == "__main__":
-    main()
+                el = fr.query_selector("#checkbox")
+                if el and (el.get_attribute("aria-checked") == "true"
+                           or "checked" in (el.get_attribute("class") or "")):
+                    print("    hcaptcha: passed on click")
+                    return True
+            except Exception:
+                pass
+        if _frames(page, "hcaptcha.com", "challenge"):
+            break
+        time.sleep(1)
+    print("    hcaptcha: audio fallback")
+    for _ in range(5):
+        if time.time() > end:
+            break
+        ch = _frames(page, "hcaptcha.com", "challenge")
+        if not ch:
+            time.sleep(2)
+            continue
+        _click_first(ch, ["#audio-button", "[aria-label*='audio' i]", ".audio-button"])
+        time.sleep(3)
+        data = _audio_bytes(ch)
+        if not data:
+            continue
+        try:
+            text = _transcribe(data)
+            print("    heard:", text)
+        except Exception as e:
+            print("    stt:", e)
+            text = ""
+        if text:
+            _fill_first(ch, ["#audio-response", "textarea", "input[type=text]"], text)
+            _click_first(ch, ["#voice-submit", ".button-submit", "button[type=submit]"])
+            time.sleep(4)
+        fr = _frames(page, "hcapt
