@@ -315,7 +315,7 @@ if fr:
                     return True
             except Exception:
                 pass
-    raise CaptchaFail("hcaptcha failed")
+    
 
 
 def solve_any(page, wait=8):
