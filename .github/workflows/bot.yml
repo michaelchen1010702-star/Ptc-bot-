@@ -5,7 +5,7 @@ on:
     inputs:
       count:
         description: 'how many accounts'
-        default: '5'
+        default: '1'
   schedule:
     - cron: '0 */6 * * *'
 
@@ -27,11 +27,13 @@ jobs:
         env:
           SHEETS_URL: ${{ secrets.SHEETS_URL }}
           SHEETS_TOKEN: ${{ secrets.SHEETS_TOKEN }}
-          COUNT: ${{ github.event.inputs.count || '5' }}
+          COUNT: ${{ github.event.inputs.count || '1' }}
         run: python bot.py
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: accounts
-          path: accounts.csv
+          path: |
+            accounts.csv
+            debug/
