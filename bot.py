@@ -34,67 +34,98 @@ def snap(page, name):
     except Exception as e:
         print("  snap failed:", e)
 
-def field_count(page):
+def all_frames(page):
     try:
-        return len(page.query_selector_all("input, select"))
+        return list(page.frames)
     except Exception:
-        return 0
+        return []
+
+def field_count(page):
+    n = 0
+    for fr in all_frames(page):
+        try:
+            n += len(fr.query_selector_all("input, select"))
+        except Exception:
+            pass
+    return n
 
 def wait_for_form(page, timeout=60, minimum=1):
     end = time.time() + timeout
     while time.time() < end:
-        if field_count(page) >= minimum:
-            print(f"  form ready ({field_count(page)} fields)")
+        c = field_count(page)
+        if c >= minimum:
+            print(f"  form ready ({c} fields)")
             return True
         time.sleep(1.5)
     print("  form never appeared")
     return False
+
+def find_any(page, selector):
+    for fr in all_frames(page):
+        try:
+            el = fr.query_selector(selector)
+            if el:
+                return el
+        except Exception:
+            pass
+    return None
 
 def click_next(page):
     for txt in ["Continue", "Next", "Sign Up", "Sign up", "Create Account",
                 "Create account", "Submit", "Register"]:
         for sel in [f'button:has-text("{txt}")', f'a:has-text("{txt}")',
                     f'input[value*="{txt}"]']:
-            try:
-                el = page.query_selector(sel)
-                if el:
+            el = find_any(page, sel)
+            if el:
+                try:
                     print(f"  clicked: {txt}")
                     el.click()
                     time.sleep(5)
                     return True
-            except Exception:
-                continue
-    try:
-        el = page.query_selector('button[type="submit"]')
-        if el:
+                except Exception:
+                    pass
+    el = find_any(page, 'button[type="submit"]')
+    if el:
+        try:
             print("  clicked: submit")
             el.click()
             time.sleep(5)
             return True
-    except Exception:
-        pass
+        except Exception:
+            pass
     return False
+
+def dump_frames(page):
+    print("  --- frames ---")
+    for fr in all_frames(page):
+        try:
+            n = len(fr.query_selector_all("input, select, button"))
+            print("    frame:", (fr.url or "")[:90], "| elements=", n)
+        except Exception:
+            pass
 
 def dump_fields(page, tag=""):
     print(f"  --- fields {tag} ---")
-    for el in page.query_selector_all("input, select, button"):
-        try:
-            t = el.evaluate("e => e.tagName.toLowerCase()")
-            txt = (el.inner_text() or "").strip()[:30]
-            print("   ", t, "name=", el.get_attribute("name"),
-                  "id=", el.get_attribute("id"),
-                  "type=", el.get_attribute("type"), "text=", txt)
-        except Exception:
-            pass
+    for fr in all_frames(page):
+        for el in fr.query_selector_all("input, select, button"):
+            try:
+                t = el.evaluate("e => e.tagName.toLowerCase()")
+                txt = (el.inner_text() or "").strip()[:30]
+                print("   ", t, "name=", el.get_attribute("name"),
+                      "id=", el.get_attribute("id"),
+                      "type=", el.get_attribute("type"), "text=", txt)
+            except Exception:
+                pass
 
 def dump_select_options(page):
-    for el in page.query_selector_all("select"):
-        try:
-            opts = [o.inner_text().strip() for o in el.query_selector_all("option")][:8]
-            print("    select name=", el.get_attribute("name"),
-                  "id=", el.get_attribute("id"), "opts=", opts)
-        except Exception:
-            pass
+    for fr in all_frames(page):
+        for el in fr.query_selector_all("select"):
+            try:
+                opts = [o.inner_text().strip() for o in el.query_selector_all("option")][:8]
+                print("    select name=", el.get_attribute("name"),
+                      "id=", el.get_attribute("id"), "opts=", opts)
+            except Exception:
+                pass
 
 # ------------------------------------------------------------ account gen
 def random_username():
@@ -152,7 +183,7 @@ class CaptchaFail(Exception):
     pass
 
 def _frames(page, *frags):
-    for f in page.frames:
+    for f in all_frames(page):
         u = f.url or ""
         if all(x in u for x in frags):
             return f
@@ -317,7 +348,6 @@ def solve_hcaptcha(page, timeout=180):
                 pass
     raise CaptchaFail("hcaptcha failed")
 
-
 def solve_any(page, wait=8):
     end = time.time() + wait
     while time.time() < end:
@@ -328,7 +358,7 @@ def solve_any(page, wait=8):
         time.sleep(0.5)
     return True
 
-
+# ------------------------------------------------------------- form fill
 def fill_label(page, label, value):
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
@@ -336,15 +366,14 @@ def fill_label(page, label, value):
                 f'input[name="{label.lower()}"]',
                 f'input[id*="{label.lower()}"]',
                 f'input[placeholder*="{label}" i]']:
-        try:
-            el = page.query_selector(sel)
-            if el:
+        el = find_any(page, sel)
+        if el:
+            try:
                 el.fill(value)
                 return True
-        except Exception:
-            continue
+            except Exception:
+                continue
     return False
-
 
 def set_select(page, label, value, index_fallback=None):
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
@@ -355,39 +384,38 @@ def set_select(page, label, value, index_fallback=None):
             f'select[id*="{label.lower()}" i]',
             f'select[aria-label*="{label}" i]']
     for sel in sels:
-        try:
-            el = page.query_selector(sel)
-            if not el:
-                continue
-            try:
-                el.select_option(label=value)
-            except Exception:
-                try:
-                    el.select_option(value=value)
-                except Exception:
-                    if index_fallback is None:
-                        continue
-                    el.select_option(index=index_fallback)
-            print(f"  set {label} = {value}")
-            return True
-        except Exception:
+        el = find_any(page, sel)
+        if not el:
             continue
+        try:
+            el.select_option(label=value)
+        except Exception:
+            try:
+                el.select_option(value=value)
+            except Exception:
+                if index_fallback is None:
+                    continue
+                try:
+                    el.select_option(index=index_fallback)
+                except Exception:
+                    continue
+        print(f"  set {label} = {value}")
+        return True
     print(f"  FAILED to set {label}")
     return False
-
 
 def check_label(page, label):
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
-    try:
-        el = page.query_selector(f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
-        if el and not el.is_checked():
-            el.check()
+    el = find_any(page, f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
+    if el:
+        try:
+            if not el.is_checked():
+                el.check()
             return True
-    except Exception:
-        pass
+        except Exception:
+            pass
     return False
-
 
 def push(row):
     if not SHEETS_URL:
@@ -400,24 +428,46 @@ def push(row):
     except Exception as e:
         print("  sheet error:", e)
 
-
+# ------------------------------------------------------------------ main
 def one_account(page, acc):
     print("  goto:", SIGNUP_URL)
     try:
         page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=45000)
+        except Exception:
+            print("  networkidle timeout (continuing)")
     except Exception as e:
         print("  goto failed:", e)
     time.sleep(8)
     print("  landed on:", page.url)
     print("  title:", page.title())
     snap(page, f"{acc['username']}_1_landed")
+    dump_frames(page)
 
-    if not wait_for_form(page, 45):
-        snap(page, f"{acc['username']}_2_noform")
+    if _frames(page, "hcaptcha.com"):
+        print("  hcaptcha present, solving...")
+        try:
+            solve_hcaptcha(page)
+        except CaptchaFail as e:
+            print("  captcha fail:", e)
+        time.sleep(4)
+        print("  after captcha url:", page.url)
+        snap(page, f"{acc['username']}_2_aftercaptcha")
+        dump_frames(page)
+
+    if not wait_for_form(page, 60):
+        snap(page, f"{acc['username']}_3_noform")
+        dump_frames(page)
         dump_fields(page, "noform")
+        body = page.content().lower()
+        for word in ("security check", "incapsula", "imperva", "just a moment",
+                     "enable javascript", "captcha"):
+            if word in body:
+                print(f"  page text mentions: {word}")
         return False
 
-    snap(page, f"{acc['username']}_3_step1")
+    snap(page, f"{acc['username']}_4_step1")
     dump_fields(page, "step1")
     dump_select_options(page)
 
@@ -426,16 +476,17 @@ def one_account(page, acc):
     set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
     set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
     time.sleep(2)
-    snap(page, f"{acc['username']}_4_birthdate_filled")
+    snap(page, f"{acc['username']}_5_step1_filled")
 
     click_next(page)
     time.sleep(6)
     print("  after step1 url:", page.url)
-    snap(page, f"{acc['username']}_5_step2")
+    snap(page, f"{acc['username']}_6_step2")
+    dump_frames(page)
     dump_fields(page, "step2")
 
     if not wait_for_form(page, 40):
-        print("  no step 2 appeared")
+        print("  no step 2")
         return False
 
     r = {}
@@ -445,7 +496,6 @@ def one_account(page, acc):
     r["confirm"]  = fill_label(page, "confirm", acc["email"])
     r["agree"]    = check_label(page, "agree")
     r["terms"]    = check_label(page, "terms")
-    r["news"]     = check_label(page, "news")
     print("  filled:", r)
 
     try:
@@ -453,14 +503,14 @@ def one_account(page, acc):
     except CaptchaFail as e:
         print("  captcha fail:", e)
 
-    snap(page, f"{acc['username']}_6_step2_filled")
+    snap(page, f"{acc['username']}_7_step2_filled")
     click_next(page)
     time.sleep(7)
     print("  after step2 url:", page.url)
-    snap(page, f"{acc['username']}_7_step3")
+    snap(page, f"{acc['username']}_8_step3")
     dump_fields(page, "step3")
 
-    for n in range(4, 8):
+    for n in range(3, 8):
         if not wait_for_form(page, 20):
             break
         print(f"  --- extra step {n} ---")
@@ -468,14 +518,13 @@ def one_account(page, acc):
         fill_label(page, "username", acc["username"])
         fill_label(page, "password", acc["password"])
         fill_label(page, "email", acc["email"])
-        fill_label(page, "confirm", acc["email"])
         check_label(page, "agree")
         check_label(page, "terms")
         try:
             solve_any(page)
         except CaptchaFail:
             pass
-        snap(page, f"{acc['username']}_x{n}_filled")
+        snap(page, f"{acc['username']}_x{n}")
         if not click_next(page):
             break
         time.sleep(6)
@@ -497,7 +546,6 @@ def one_account(page, acc):
     time.sleep(3)
     print("  activated")
     return True
-
 
 def main():
     results = []
@@ -529,7 +577,6 @@ def main():
 
         browser.close()
     print("done:", OUT)
-
 
 if __name__ == "__main__":
     main()
