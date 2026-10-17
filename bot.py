@@ -570,12 +570,12 @@ def one_account(page, acc):
 def main():
     results = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
+        browser = p.chromium.launch(headless=False, args=[
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
         ])
         ctx = browser.new_context(
-            user_agent=UA,
             viewport={"width": 1366, "height": 900},
             locale="en-US",
         )
