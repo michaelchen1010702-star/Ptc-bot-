@@ -551,4 +551,63 @@ def one_account(page, acc):
 
     body = page.content().lower()
     for bad in ("already taken", "already exists", "not available", "invalid",
-                "required", "error", "verify
+                "required", "error", "verify"):
+        if bad in body:
+            print(f"  page mentions: {bad}")
+
+    print("  waiting for email...")
+    link = wait_for_link(acc["email"], acc["mail_token"], timeout=180)
+    if not link:
+        print("  no email")
+        return False
+    print("  link:", link[:80])
+    page.goto(link, wait_until="domcontentloaded", timeout=90000)
+    time.sleep(3)
+    print("  activated")
+    return True
+
+
+def main():
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+        ])
+        ctx = browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+        )
+        ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+        )
+        page = ctx.new_page()
+
+        for i in range(COUNT):
+            print(f"[{i+1}/{COUNT}] start")
+            acc = {"username": random_username(), "password": random_password()}
+            acc["email"], acc["mail_token"] = create_inbox()
+            print("  email:", acc["email"])
+            try:
+                acc["status"] = "ok" if one_account(page, acc) else "failed"
+            except PWTimeout as e:
+                print("  timeout:", e); acc["status"] = "timeout"
+            except Exception as e:
+                print("  error:", repr(e)); acc["status"] = "error"
+
+            results.append(acc)
+            push({k: acc[k] for k in ("username", "password", "email", "status")})
+            with open(OUT, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
+                                   extrasaction="ignore")
+                w.writeheader(); w.writerows(results)
+            print(f"  -> {acc['username']} [{acc['status']}]")
+            time.sleep(PAUSE)
+
+        browser.close()
+    print("done:", OUT)
+
+
+if __name__ == "__main__":
+    main()
