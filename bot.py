@@ -3,7 +3,6 @@ import csv, os, random, re, string, subprocess, tempfile, time
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ----------------------------------------------------------------- config
 SIGNUP_URL = "https://join.pokemon.com/"
 COUNTRY    = "United States"
 DOB_YEAR, DOB_MONTH, DOB_DAY = 1990, 1, 1
@@ -24,7 +23,6 @@ WORDS = ["ash","misty","brock","pika","gengar","eevee","snorlax","gyara",
 
 os.makedirs(DBG, exist_ok=True)
 
-# ------------------------------------------------------------- utilities
 def snap(page, name):
     try:
         page.screenshot(path=f"{DBG}/{name}.png", full_page=True)
@@ -49,17 +47,6 @@ def field_count(page):
             pass
     return n
 
-def wait_for_form(page, timeout=60, minimum=1):
-    end = time.time() + timeout
-    while time.time() < end:
-        c = field_count(page)
-        if c >= minimum:
-            print(f"  form ready ({c} fields)")
-            return True
-        time.sleep(1.5)
-    print("  form never appeared")
-    return False
-
 def find_any(page, selector):
     for fr in all_frames(page):
         try:
@@ -70,37 +57,28 @@ def find_any(page, selector):
             pass
     return None
 
-def click_next(page):
-    for txt in ["Continue", "Next", "Sign Up", "Sign up", "Create Account",
-                "Create account", "Submit", "Register"]:
-        for sel in [f'button:has-text("{txt}")', f'a:has-text("{txt}")',
-                    f'input[value*="{txt}"]']:
-            el = find_any(page, sel)
-            if el:
-                try:
-                    print(f"  clicked: {txt}")
-                    el.click()
-                    time.sleep(5)
-                    return True
-                except Exception:
-                    pass
-    el = find_any(page, 'button[type="submit"]')
-    if el:
-        try:
-            print("  clicked: submit")
-            el.click()
-            time.sleep(5)
-            return True
-        except Exception:
-            pass
-    return False
+def page_text(page):
+    try:
+        t = page.inner_text("body")
+        t = re.sub(r"\s+", " ", t).strip()
+        print("  page text:", repr(t[:400]))
+    except Exception:
+        pass
 
 def dump_frames(page):
     print("  --- frames ---")
     for fr in all_frames(page):
         try:
-            n = len(fr.query_selector_all("input, select, button"))
-            print("    frame:", (fr.url or "")[:90], "| elements=", n)
+            n = len(fr.query_selector_all("input, select, button, iframe"))
+            print("    frame:", (fr.url or "")[:100], "| elements=", n)
+        except Exception:
+            pass
+
+def dump_iframes(page):
+    print("  --- iframes ---")
+    for el in page.query_selector_all("iframe"):
+        try:
+            print("    iframe src:", (el.get_attribute("src") or "")[:110])
         except Exception:
             pass
 
@@ -127,7 +105,6 @@ def dump_select_options(page):
             except Exception:
                 pass
 
-# ------------------------------------------------------------ account gen
 def random_username():
     base = random.choice(WORDS) + random.choice(WORDS)
     tail = "".join(random.choices(string.digits, k=random.randint(2, 5)))
@@ -141,7 +118,6 @@ def random_password():
     random.shuffle(pw)
     return "".join(pw)[:16]
 
-# ---------------------------------------------------------------- mail.tm
 MAIL = "https://api.mail.tm"
 
 def create_inbox():
@@ -178,7 +154,6 @@ def wait_for_link(addr, tok, timeout=180):
         time.sleep(5)
     return None
 
-# ---------------------------------------------------------------- captcha
 class CaptchaFail(Exception):
     pass
 
@@ -356,9 +331,19 @@ def solve_any(page, wait=8):
         if _frames(page, "hcaptcha.com"):
             return solve_hcaptcha(page)
         time.sleep(0.5)
-    return True
+    raise CaptchaFail("no captcha frame found")
 
-# ------------------------------------------------------------- form fill
+def wait_for_ready(page, timeout=60):
+    """Wait until either a form or a captcha appears."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if _frames(page, "hcaptcha.com") or _frames(page, "recaptcha/api2"):
+            return "captcha"
+        if field_count(page) >= 2:
+            return "form"
+        time.sleep(1.5)
+    return "none"
+
 def fill_label(page, label, value):
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
@@ -417,6 +402,31 @@ def check_label(page, label):
             pass
     return False
 
+def click_next(page):
+    for txt in ["Continue", "Next", "Sign Up", "Sign up", "Create Account",
+                "Create account", "Submit", "Register", "Verify"]:
+        for sel in [f'button:has-text("{txt}")', f'a:has-text("{txt}")',
+                    f'input[value*="{txt}"]']:
+            el = find_any(page, sel)
+            if el:
+                try:
+                    print(f"  clicked: {txt}")
+                    el.click()
+                    time.sleep(5)
+                    return True
+                except Exception:
+                    pass
+    el = find_any(page, 'button[type="submit"]')
+    if el:
+        try:
+            print("  clicked: submit")
+            el.click()
+            time.sleep(5)
+            return True
+        except Exception:
+            pass
+    return False
+
 def push(row):
     if not SHEETS_URL:
         print("  sheet: no SHEETS_URL")
@@ -428,46 +438,51 @@ def push(row):
     except Exception as e:
         print("  sheet error:", e)
 
-# ------------------------------------------------------------------ main
 def one_account(page, acc):
     print("  goto:", SIGNUP_URL)
     try:
         page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=45000)
-        except Exception:
-            print("  networkidle timeout (continuing)")
     except Exception as e:
         print("  goto failed:", e)
     time.sleep(8)
     print("  landed on:", page.url)
-    print("  title:", page.title())
+    page_text(page)
     snap(page, f"{acc['username']}_1_landed")
     dump_frames(page)
+    dump_iframes(page)
 
-    if _frames(page, "hcaptcha.com"):
-        print("  hcaptcha present, solving...")
-        try:
-            solve_hcaptcha(page)
-        except CaptchaFail as e:
-            print("  captcha fail:", e)
-        time.sleep(4)
-        print("  after captcha url:", page.url)
-        snap(page, f"{acc['username']}_2_aftercaptcha")
-        dump_frames(page)
+    # try up to 3 rounds: solve any challenge, then look for the form
+    for attempt in range(3):
+        state = wait_for_ready(page, 45)
+        print(f"  round {attempt}: state={state}")
+        if state == "form":
+            break
+        if state == "captcha":
+            try:
+                solve_any(page, wait=5)
+                print("  captcha solved")
+            except CaptchaFail as e:
+                print("  captcha fail:", e)
+            time.sleep(6)
+            snap(page, f"{acc['username']}_cap{attempt}")
+            dump_frames(page)
+            dump_iframes(page)
+            continue
+        # state == none
+        print("  nothing yet, waiting more")
+        page_text(page)
+        snap(page, f"{acc['username']}_stuck{attempt}")
+        time.sleep(10)
 
-    if not wait_for_form(page, 60):
-        snap(page, f"{acc['username']}_3_noform")
+    if field_count(page) == 0:
+        print("  still no form")
+        snap(page, f"{acc['username']}_nofields")
         dump_frames(page)
-        dump_fields(page, "noform")
-        body = page.content().lower()
-        for word in ("security check", "incapsula", "imperva", "just a moment",
-                     "enable javascript", "captcha"):
-            if word in body:
-                print(f"  page text mentions: {word}")
+        dump_iframes(page)
+        dump_fields(page, "final")
         return False
 
-    snap(page, f"{acc['username']}_4_step1")
+    snap(page, f"{acc['username']}_2_form")
     dump_fields(page, "step1")
     dump_select_options(page)
 
@@ -476,18 +491,22 @@ def one_account(page, acc):
     set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
     set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
     time.sleep(2)
-    snap(page, f"{acc['username']}_5_step1_filled")
+    snap(page, f"{acc['username']}_3_step1_filled")
 
     click_next(page)
     time.sleep(6)
     print("  after step1 url:", page.url)
-    snap(page, f"{acc['username']}_6_step2")
+    snap(page, f"{acc['username']}_4_step2")
     dump_frames(page)
     dump_fields(page, "step2")
 
-    if not wait_for_form(page, 40):
-        print("  no step 2")
-        return False
+    for attempt in range(2):
+        if wait_for_ready(page, 30) == "captcha":
+            try:
+                solve_any(page, wait=5)
+            except CaptchaFail:
+                pass
+            time.sleep(5)
 
     r = {}
     r["username"] = fill_label(page, "username", acc["username"])
@@ -499,19 +518,19 @@ def one_account(page, acc):
     print("  filled:", r)
 
     try:
-        solve_any(page)
+        solve_any(page, wait=5)
     except CaptchaFail as e:
         print("  captcha fail:", e)
 
-    snap(page, f"{acc['username']}_7_step2_filled")
+    snap(page, f"{acc['username']}_5_step2_filled")
     click_next(page)
     time.sleep(7)
     print("  after step2 url:", page.url)
-    snap(page, f"{acc['username']}_8_step3")
+    snap(page, f"{acc['username']}_6_step3")
     dump_fields(page, "step3")
 
     for n in range(3, 8):
-        if not wait_for_form(page, 20):
+        if field_count(page) == 0:
             break
         print(f"  --- extra step {n} ---")
         dump_fields(page, f"step{n}")
@@ -521,7 +540,7 @@ def one_account(page, acc):
         check_label(page, "agree")
         check_label(page, "terms")
         try:
-            solve_any(page)
+            solve_any(page, wait=4)
         except CaptchaFail:
             pass
         snap(page, f"{acc['username']}_x{n}")
@@ -532,51 +551,4 @@ def one_account(page, acc):
 
     body = page.content().lower()
     for bad in ("already taken", "already exists", "not available", "invalid",
-                "required", "error", "captcha", "verify"):
-        if bad in body:
-            print(f"  page mentions: {bad}")
-
-    print("  waiting for email...")
-    link = wait_for_link(acc["email"], acc["mail_token"], timeout=180)
-    if not link:
-        print("  no email")
-        return False
-    print("  link:", link[:80])
-    page.goto(link, wait_until="domcontentloaded", timeout=90000)
-    time.sleep(3)
-    print("  activated")
-    return True
-
-def main():
-    results = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(user_agent=UA, viewport={"width": 1366, "height": 900})
-        page = ctx.new_page()
-
-        for i in range(COUNT):
-            print(f"[{i+1}/{COUNT}] start")
-            acc = {"username": random_username(), "password": random_password()}
-            acc["email"], acc["mail_token"] = create_inbox()
-            print("  email:", acc["email"])
-            try:
-                acc["status"] = "ok" if one_account(page, acc) else "failed"
-            except PWTimeout as e:
-                print("  timeout:", e); acc["status"] = "timeout"
-            except Exception as e:
-                print("  error:", repr(e)); acc["status"] = "error"
-
-            results.append(acc)
-            push({k: acc[k] for k in ("username", "password", "email", "status")})
-            with open(OUT, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
-                                   extrasaction="ignore")
-                w.writeheader(); w.writerows(results)
-            print(f"  -> {acc['username']} [{acc['status']}]")
-            time.sleep(PAUSE)
-
-        browser.close()
-    print("done:", OUT)
-
-if __name__ == "__main__":
-    main()
+                "required", "error", "verify
