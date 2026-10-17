@@ -438,6 +438,23 @@ def push(row):
     except Exception as e:
         print("  sheet error:", e)
 
+        ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+        )def click_text(page, text):
+    for sel in [f'button:has-text("{text}")', f'a:has-text("{text}")',
+                f'input[value*="{text}"]']:
+        el = find_any(page, sel)
+        if el:
+            try:
+                el.click()
+                print(f"  clicked: {text}")
+                time.sleep(4)
+                return True
+            except Exception:
+                pass
+    return False
+
+
 def one_account(page, acc):
     print("  goto:", SIGNUP_URL)
     try:
@@ -448,10 +465,7 @@ def one_account(page, acc):
     print("  landed on:", page.url)
     page_text(page)
     snap(page, f"{acc['username']}_1_landed")
-    dump_frames(page)
-    dump_iframes(page)
 
-    # try up to 3 rounds: solve any challenge, then look for the form
     for attempt in range(3):
         state = wait_for_ready(page, 45)
         print(f"  round {attempt}: state={state}")
@@ -460,53 +474,46 @@ def one_account(page, acc):
         if state == "captcha":
             try:
                 solve_any(page, wait=5)
-                print("  captcha solved")
             except CaptchaFail as e:
                 print("  captcha fail:", e)
             time.sleep(6)
-            snap(page, f"{acc['username']}_cap{attempt}")
-            dump_frames(page)
-            dump_iframes(page)
             continue
-        # state == none
-        print("  nothing yet, waiting more")
-        page_text(page)
-        snap(page, f"{acc['username']}_stuck{attempt}")
         time.sleep(10)
 
     if field_count(page) == 0:
         print("  still no form")
         snap(page, f"{acc['username']}_nofields")
         dump_frames(page)
-        dump_iframes(page)
-        dump_fields(page, "final")
         return False
 
-    snap(page, f"{acc['username']}_2_form")
-    dump_fields(page, "step1")
-    dump_select_options(page)
-
+    # ---- STEP 1: age gate ----
+    snap(page, f"{acc['username']}_2_agegate")
+    dump_fields(page, "agegate")
     set_select(page, "country", COUNTRY)
     set_select(page, "year", str(DOB_YEAR))
     set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
     set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
     time.sleep(2)
-    snap(page, f"{acc['username']}_3_step1_filled")
+    snap(page, f"{acc['username']}_3_agegate_filled")
+    click_text(page, "Continue")
+    time.sleep(5)
 
-    click_next(page)
-    time.sleep(6)
-    print("  after step1 url:", page.url)
-    snap(page, f"{acc['username']}_4_step2")
-    dump_frames(page)
-    dump_fields(page, "step2")
+    # ---- STEP 2: confirm birthdate ----
+    snap(page, f"{acc['username']}_4_confirm")
+    dump_fields(page, "confirm")
+    if click_text(page, "Yes, This Is Correct"):
+        print("  birthdate confirmed")
+        time.sleep(6)
 
-    for attempt in range(2):
-        if wait_for_ready(page, 30) == "captcha":
-            try:
-                solve_any(page, wait=5)
-            except CaptchaFail:
-                pass
-            time.sleep(5)
+    # ---- STEP 3: account details ----
+    for _ in range(4):
+        if find_any(page, 'input[type="password"]'):
+            break
+        print("  waiting for account fields...")
+        time.sleep(5)
+
+    snap(page, f"{acc['username']}_5_account")
+    dump_fields(page, "account")
 
     r = {}
     r["username"] = fill_label(page, "username", acc["username"])
@@ -517,37 +524,35 @@ def one_account(page, acc):
     r["terms"]    = check_label(page, "terms")
     print("  filled:", r)
 
-    try:
-        solve_any(page, wait=5)
-    except CaptchaFail as e:
-        print("  captcha fail:", e)
+    snap(page, f"{acc['username']}_6_account_filled")
+    click_text(page, "Continue")
+    click_text(page, "Sign Up")
+    time.sleep(8)
+    print("  after details url:", page.url)
+    snap(page, f"{acc['username']}_7_afterdetails")
+    dump_fields(page, "afterdetails")
 
-    snap(page, f"{acc['username']}_5_step2_filled")
-    click_next(page)
-    time.sleep(7)
-    print("  after step2 url:", page.url)
-    snap(page, f"{acc['username']}_6_step3")
-    dump_fields(page, "step3")
-
-    for n in range(3, 8):
+    # ---- any remaining steps ----
+    for n in range(2, 7):
         if field_count(page) == 0:
             break
         print(f"  --- extra step {n} ---")
-        dump_fields(page, f"step{n}")
+        if click_text(page, "Yes, This Is Correct"):
+            time.sleep(6)
+            snap(page, f"{acc['username']}_x{n}_confirm")
+            dump_fields(page, f"step{n}")
+            continue
         fill_label(page, "username", acc["username"])
         fill_label(page, "password", acc["password"])
         fill_label(page, "email", acc["email"])
         check_label(page, "agree")
         check_label(page, "terms")
-        try:
-            solve_any(page, wait=4)
-        except CaptchaFail:
-            pass
-        snap(page, f"{acc['username']}_x{n}")
-        if not click_next(page):
+        snap(page, f"{acc['username']}_x{n}_filled")
+        if not (click_text(page, "Continue") or click_text(page, "Sign Up")):
             break
-        time.sleep(6)
+        time.sleep(7)
         print(f"  after step{n} url:", page.url)
+        dump_fields(page, f"after{n}")
 
     body = page.content().lower()
     for bad in ("already taken", "already exists", "not available", "invalid",
