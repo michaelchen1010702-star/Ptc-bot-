@@ -22,20 +22,10 @@ jobs:
       - name: diagnose bot.py
         if: always()
         run: |
-          echo "=== line count ==="
           wc -l bot.py
-          echo "=== lines with non-ascii characters ==="
-          python3 -c "
-          for i, line in enumerate(open('bot.py', encoding='utf-8'), 1):
-              if any(ord(c) > 126 for c in line):
-                  print(i, repr(line))
-          "
-          echo "=== lines 305-315 ==="
-          sed -n '305,315p' bot.py
-          echo "=== compile test ==="
           python3 -m py_compile bot.py && echo COMPILE_OK || echo COMPILE_FAILED
 
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg xvfb
       - run: pip install -r requirements.txt
       - run: playwright install --with-deps chromium
 
@@ -44,7 +34,7 @@ jobs:
           SHEETS_URL: ${{ secrets.SHEETS_URL }}
           SHEETS_TOKEN: ${{ secrets.SHEETS_TOKEN }}
           COUNT: ${{ github.event.inputs.count || '1' }}
-        run: python bot.py
+        run: xvfb-run -a python bot.py
 
       - uses: actions/upload-artifact@v4
         if: always()
