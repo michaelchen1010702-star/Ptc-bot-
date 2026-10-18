@@ -228,7 +228,7 @@ def _transcribe(data):
             try: os.unlink(p)
             except Exception: pass
 
-def solve_recaptcha(page, timeout=180):
+def solve_recaptcha(page, timeout=90):
     end = time.time() + timeout
     anchor = None
     while time.time() < end and not anchor:
@@ -325,23 +325,25 @@ def solve_hcaptcha(page, timeout=180):
                 pass
     raise CaptchaFail("hcaptcha failed")
 
-def solve_any(page, wait=8):
+def solve_any(page, wait=6):
     end = time.time() + wait
     while time.time() < end:
+        if _frames(page, "hcaptcha.com", "checkbox"):
+            return solve_hcaptcha(page)
         if _frames(page, "recaptcha", "anchor"):
             return solve_recaptcha(page)
-        if _frames(page, "hcaptcha.com"):
-            return solve_hcaptcha(page)
         time.sleep(0.5)
     raise CaptchaFail("no captcha frame found")
 
 def wait_for_ready(page, timeout=60):
     end = time.time() + timeout
     while time.time() < end:
-        if _frames(page, "recaptcha", "anchor") or _frames(page, "hcaptcha.com"):
-            return "captcha"
         if field_count(page) >= 2:
             return "form"
+        if _frames(page, "hcaptcha.com", "checkbox"):
+            return "captcha"
+        if _frames(page, "recaptcha", "anchor"):
+            return "captcha"
         time.sleep(1.5)
     return "none"
 
@@ -392,6 +394,17 @@ def set_select(page, label, value, index_fallback=None):
     return False
 
 def check_label(page, label):
+    for sel in [f'input[name="{label}"]', f'input[id="{label}"]',
+                f'input[name*="{label}" i]', f'input[id*="{label}" i]']:
+        el = find_any(page, sel)
+        if el:
+            try:
+                if not el.is_checked():
+                    el.check()
+                print(f"  checked: {label}")
+                return True
+            except Exception:
+                pass
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
     el = find_any(page, f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
@@ -399,6 +412,7 @@ def check_label(page, label):
         try:
             if not el.is_checked():
                 el.check()
+            print(f"  checked: {label}")
             return True
         except Exception:
             pass
@@ -449,12 +463,13 @@ def one_account(page, acc):
             break
         if state == "captcha":
             try:
-                solve_any(page, wait=5)
+                solve_any(page, wait=4)
+                print("  captcha solved")
             except CaptchaFail as e:
                 print("  captcha fail:", e)
-            time.sleep(6)
+            time.sleep(4)
             continue
-        time.sleep(10)
+        time.sleep(8)
 
     if field_count(page) == 0:
         print("  still no form")
@@ -464,7 +479,6 @@ def one_account(page, acc):
 
     # ---- STEP 1: age gate ----
     snap(page, f"{acc['username']}_2_agegate")
-    dump_fields(page, "agegate")
     set_select(page, "country", COUNTRY)
     set_select(page, "year", str(DOB_YEAR))
     set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
@@ -476,14 +490,13 @@ def one_account(page, acc):
 
     # ---- STEP 2: confirm birthdate ----
     snap(page, f"{acc['username']}_4_confirm")
-    dump_fields(page, "confirm")
     if click_text(page, "Yes, This Is Correct"):
         print("  birthdate confirmed")
         time.sleep(6)
 
     # ---- STEP 3: account details ----
     for _ in range(4):
-        if find_any(page, 'input[type="password"]'):
+        if find_any(page, 'input[name="username"]'):
             break
         print("  waiting for account fields...")
         time.sleep(5)
@@ -495,14 +508,15 @@ def one_account(page, acc):
     r["username"] = fill_label(page, "username", acc["username"])
     r["password"] = fill_label(page, "password", acc["password"])
     r["email"]    = fill_label(page, "email", acc["email"])
-    r["confirm"]  = fill_label(page, "confirm", acc["email"])
-    r["agree"]    = check_label(page, "agree")
-    r["terms"]    = check_label(page, "terms")
     print("  filled:", r)
 
+    ticked = check_label(page, "terms") or check_label(page, "agree")
+    print("  terms ticked:", ticked)
+    time.sleep(1)
+
     snap(page, f"{acc['username']}_6_account_filled")
+
     click_text(page, "Continue")
-    click_text(page, "Sign Up")
     time.sleep(8)
     print("  after details url:", page.url)
     snap(page, f"{acc['username']}_7_afterdetails")
@@ -516,15 +530,13 @@ def one_account(page, acc):
         if click_text(page, "Yes, This Is Correct"):
             time.sleep(6)
             snap(page, f"{acc['username']}_x{n}_confirm")
-            dump_fields(page, f"step{n}")
             continue
         fill_label(page, "username", acc["username"])
         fill_label(page, "password", acc["password"])
         fill_label(page, "email", acc["email"])
-        check_label(page, "agree")
         check_label(page, "terms")
         snap(page, f"{acc['username']}_x{n}_filled")
-        if not (click_text(page, "Continue") or click_text(page, "Sign Up")):
+        if not click_text(page, "Continue"):
             break
         time.sleep(7)
         print(f"  after step{n} url:", page.url)
