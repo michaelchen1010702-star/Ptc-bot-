@@ -3,6 +3,7 @@ import csv, os, random, re, string, subprocess, tempfile, time
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
+# ----------------------------------------------------------------- config
 SIGNUP_URL = "https://join.pokemon.com/"
 COUNTRY    = "United States"
 DOB_YEAR, DOB_MONTH, DOB_DAY = 1990, 1, 1
@@ -15,14 +16,12 @@ DBG        = "debug"
 SHEETS_URL   = os.getenv("SHEETS_URL", "")
 SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
-
 WORDS = ["ash","misty","brock","pika","gengar","eevee","snorlax","gyara",
          "dragon","mewtwo","lapras","zapdos","onix","psy","golem","machop"]
 
 os.makedirs(DBG, exist_ok=True)
 
+# ------------------------------------------------------------- utilities
 def snap(page, name):
     try:
         page.screenshot(path=f"{DBG}/{name}.png", full_page=True)
@@ -105,6 +104,7 @@ def dump_select_options(page):
             except Exception:
                 pass
 
+# ------------------------------------------------------------ account gen
 def random_username():
     base = random.choice(WORDS) + random.choice(WORDS)
     tail = "".join(random.choices(string.digits, k=random.randint(2, 5)))
@@ -118,6 +118,7 @@ def random_password():
     random.shuffle(pw)
     return "".join(pw)[:16]
 
+# ---------------------------------------------------------------- mail.tm
 MAIL = "https://api.mail.tm"
 
 def create_inbox():
@@ -154,6 +155,7 @@ def wait_for_link(addr, tok, timeout=180):
         time.sleep(5)
     return None
 
+# ---------------------------------------------------------------- captcha
 class CaptchaFail(Exception):
     pass
 
@@ -230,7 +232,7 @@ def solve_recaptcha(page, timeout=180):
     end = time.time() + timeout
     anchor = None
     while time.time() < end and not anchor:
-        anchor = _frames(page, "recaptcha/api2/anchor")
+        anchor = _frames(page, "recaptcha", "anchor")
         time.sleep(0.5)
     if not anchor:
         raise CaptchaFail("no recaptcha")
@@ -240,7 +242,7 @@ def solve_recaptcha(page, timeout=180):
     if a and a.get_attribute("aria-checked") == "true":
         return True
     for _ in range(5):
-        bf = _frames(page, "recaptcha/api2/bframe")
+        bf = _frames(page, "recaptcha", "bframe")
         if not bf:
             time.sleep(2)
             continue
@@ -326,7 +328,7 @@ def solve_hcaptcha(page, timeout=180):
 def solve_any(page, wait=8):
     end = time.time() + wait
     while time.time() < end:
-        if _frames(page, "recaptcha/api2/anchor"):
+        if _frames(page, "recaptcha", "anchor"):
             return solve_recaptcha(page)
         if _frames(page, "hcaptcha.com"):
             return solve_hcaptcha(page)
@@ -334,16 +336,16 @@ def solve_any(page, wait=8):
     raise CaptchaFail("no captcha frame found")
 
 def wait_for_ready(page, timeout=60):
-    """Wait until either a form or a captcha appears."""
     end = time.time() + timeout
     while time.time() < end:
-        if _frames(page, "hcaptcha.com") or _frames(page, "recaptcha/api2"):
+        if _frames(page, "recaptcha", "anchor") or _frames(page, "hcaptcha.com"):
             return "captcha"
         if field_count(page) >= 2:
             return "form"
         time.sleep(1.5)
     return "none"
 
+# ------------------------------------------------------------- form fill
 def fill_label(page, label, value):
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
@@ -402,45 +404,7 @@ def check_label(page, label):
             pass
     return False
 
-def click_next(page):
-    for txt in ["Continue", "Next", "Sign Up", "Sign up", "Create Account",
-                "Create account", "Submit", "Register", "Verify"]:
-        for sel in [f'button:has-text("{txt}")', f'a:has-text("{txt}")',
-                    f'input[value*="{txt}"]']:
-            el = find_any(page, sel)
-            if el:
-                try:
-                    print(f"  clicked: {txt}")
-                    el.click()
-                    time.sleep(5)
-                    return True
-                except Exception:
-                    pass
-    el = find_any(page, 'button[type="submit"]')
-    if el:
-        try:
-            print("  clicked: submit")
-            el.click()
-            time.sleep(5)
-            return True
-        except Exception:
-            pass
-    return False
-
-def push(row):
-    if not SHEETS_URL:
-        print("  sheet: no SHEETS_URL")
-        return
-    try:
-        r = requests.post(SHEETS_URL, json={"token": SHEETS_TOKEN, "accounts": [row]},
-                          allow_redirects=True, timeout=30)
-        print("  sheet:", r.text[:50])
-    except Exception as e:
-        print("  sheet error:", e)
-
-        ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-        )def click_text(page, text):
+def click_text(page, text):
     for sel in [f'button:has-text("{text}")', f'a:has-text("{text}")',
                 f'input[value*="{text}"]']:
         el = find_any(page, sel)
@@ -454,7 +418,19 @@ def push(row):
                 pass
     return False
 
+# ---------------------------------------------------------------- sheets
+def push(row):
+    if not SHEETS_URL:
+        print("  sheet: no SHEETS_URL")
+        return
+    try:
+        r = requests.post(SHEETS_URL, json={"token": SHEETS_TOKEN, "accounts": [row]},
+                          allow_redirects=True, timeout=30)
+        print("  sheet:", r.text[:50])
+    except Exception as e:
+        print("  sheet error:", e)
 
+# ------------------------------------------------------------------ main
 def one_account(page, acc):
     print("  goto:", SIGNUP_URL)
     try:
@@ -571,7 +547,6 @@ def one_account(page, acc):
     print("  activated")
     return True
 
-
 def main():
     results = []
     with sync_playwright() as p:
@@ -612,7 +587,6 @@ def main():
 
         browser.close()
     print("done:", OUT)
-
 
 if __name__ == "__main__":
     main()
