@@ -12,10 +12,12 @@ COUNT      = int(os.getenv("COUNT", "1"))
 PAUSE      = 8
 OUT        = "accounts.csv"
 DBG        = "debug"
+MAIL_DOMAIN = os.getenv("MAIL_DOMAIN", "")
 
 SHEETS_URL   = os.getenv("SHEETS_URL", "")
 SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
 
+SYMBOLS = "!@#$%^&*"
 WORDS = ["ash","misty","brock","pika","gengar","eevee","snorlax","gyara",
          "dragon","mewtwo","lapras","zapdos","onix","psy","golem","machop"]
 
@@ -73,14 +75,6 @@ def dump_frames(page):
         except Exception:
             pass
 
-def dump_iframes(page):
-    print("  --- iframes ---")
-    for el in page.query_selector_all("iframe"):
-        try:
-            print("    iframe src:", (el.get_attribute("src") or "")[:110])
-        except Exception:
-            pass
-
 def dump_fields(page, tag=""):
     print(f"  --- fields {tag} ---")
     for fr in all_frames(page):
@@ -94,17 +88,6 @@ def dump_fields(page, tag=""):
             except Exception:
                 pass
 
-def dump_select_options(page):
-    for fr in all_frames(page):
-        for el in fr.query_selector_all("select"):
-            try:
-                opts = [o.inner_text().strip() for o in el.query_selector_all("option")][:8]
-                print("    select name=", el.get_attribute("name"),
-                      "id=", el.get_attribute("id"), "opts=", opts)
-            except Exception:
-                pass
-
-# ------------------------------------------------------------ Error reader
 def dump_errors(page):
     for fr in all_frames(page):
         try:
@@ -127,14 +110,12 @@ def random_username():
     tail = "".join(random.choices(string.digits, k=random.randint(2, 5)))
     return (base + tail)[:16]
 
-SYMBOLS = "!@#$%^&*"
-
 def random_password():
     lower = random.choice(string.ascii_lowercase)
     upper = random.choice(string.ascii_uppercase)
     digit = random.choice(string.digits)
-    sym = random.choice(SYMBOLS)
-    rest = "".join(random.choices(string.ascii_letters + string.digits, k=8))
+    sym   = random.choice(SYMBOLS)
+    rest  = "".join(random.choices(string.ascii_letters + string.digits, k=8))
     pw = list(lower + upper + digit + sym + rest)
     random.shuffle(pw)
     return "".join(pw)
@@ -142,12 +123,26 @@ def random_password():
 # ---------------------------------------------------------------- mail.tm
 MAIL = "https://api.mail.tm"
 
-def create_inbox():
-    domain = requests.get(f"{MAIL}/domains").json()["hydra:member"][0]["domain"]
+def mail_domains():
+    try:
+        r = requests.get(f"{MAIL}/domains", timeout=20).json()
+        return [d["domain"] for d in r.get("hydra:member", [])]
+    except Exception as e:
+        print("  domain list failed:", e)
+        return []
+
+def create_inbox(domain=None):
+    if not domain:
+        ds = mail_domains()
+        domain = ds[0] if ds else None
+    if not domain:
+        raise RuntimeError("no mail.tm domain available")
     addr = "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "@" + domain
     pw = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-    requests.post(f"{MAIL}/accounts", json={"address": addr, "password": pw}).raise_for_status()
-    tok = requests.post(f"{MAIL}/token", json={"address": addr, "password": pw}).json()["token"]
+    requests.post(f"{MAIL}/accounts", json={"address": addr, "password": pw},
+                  timeout=20).raise_for_status()
+    tok = requests.post(f"{MAIL}/token", json={"address": addr, "password": pw},
+                        timeout=20).json()["token"]
     return addr, tok
 
 def wait_for_link(addr, tok, timeout=180):
@@ -155,7 +150,7 @@ def wait_for_link(addr, tok, timeout=180):
     end = time.time() + timeout
     seen = 0
     while time.time() < end:
-        r = requests.get(f"{MAIL}/messages", headers=h)
+        r = requests.get(f"{MAIL}/messages", headers=h, timeout=20)
         if r.status_code == 200:
             msgs = r.json().get("hydra:member", [])
             if len(msgs) != seen:
@@ -165,7 +160,8 @@ def wait_for_link(addr, tok, timeout=180):
                 frm = (m.get("from") or {}).get("address", "").lower()
                 subj = (m.get("subject") or "")[:60]
                 print(f"    msg from={frm} subj={subj}")
-                full = requests.get(f"{MAIL}/messages/{m['id']}", headers=h).json()
+                full = requests.get(f"{MAIL}/messages/{m['id']}", headers=h,
+                                    timeout=20).json()
                 html = full.get("html") or []
                 body = " ".join(html) if isinstance(html, list) else str(html)
                 body += " " + (full.get("text") or "")
@@ -495,22 +491,18 @@ def one_account(page, acc):
     if field_count(page) == 0:
         print("  still no form")
         snap(page, f"{acc['username']}_nofields")
-        dump_frames(page)
-        return False
+        return "failed"
 
     # ---- STEP 1: age gate ----
-    snap(page, f"{acc['username']}_2_agegate")
     set_select(page, "country", COUNTRY)
     set_select(page, "year", str(DOB_YEAR))
     set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
     set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
     time.sleep(2)
-    snap(page, f"{acc['username']}_3_agegate_filled")
     click_text(page, "Continue")
     time.sleep(5)
 
     # ---- STEP 2: confirm birthdate ----
-    snap(page, f"{acc['username']}_4_confirm")
     if click_text(page, "Yes, This Is Correct"):
         print("  birthdate confirmed")
         time.sleep(6)
@@ -519,13 +511,10 @@ def one_account(page, acc):
     for _ in range(4):
         if find_any(page, 'input[name="username"]'):
             break
-        print("  waiting for account fields...")
         time.sleep(5)
 
     snap(page, f"{acc['username']}_5_account")
-    dump_fields(page, "account")
 
-    # ---- Submit block with debugging ----
     r = {}
     r["username"] = fill_label(page, "username", acc["username"])
     r["password"] = fill_label(page, "password", acc["password"])
@@ -539,74 +528,34 @@ def one_account(page, acc):
         except Exception:
             pass
 
-    ticked = check_label(page, "terms") or check_label(page, "agree")
-    print("  terms ticked:", ticked)
-
-    for name in ("username", "password", "email"):
-        el = find_any(page, f'input[name="{name}"]')
-        if el:
-            try:
-                print(f"    value[{name}] =", repr(el.input_value()))
-            except Exception:
-                pass
-
-    try:
-        print("  invalid field present:", bool(find_any(page, "input:invalid")))
-    except Exception:
-        pass
-
+    print("  terms ticked:", check_label(page, "terms"))
     time.sleep(1)
-    snap(page, f"{acc['username']}_6_account_filled")
 
     click_text(page, "Continue")
     time.sleep(8)
-    print("  after details url:", page.url)
+    print("  after submit url:", page.url)
     page_text(page)
     dump_errors(page)
-    tok = find_any(page, 'input[id="recaptcha-token"]')
-    if tok:
-        try:
-            print("  recaptcha token length:", len(tok.input_value() or ""))
-        except Exception:
-            pass
     snap(page, f"{acc['username']}_7_afterdetails")
 
-    # ---- any remaining steps ----
-    for n in range(2, 7):
-        if field_count(page) == 0:
-            break
-        print(f"  --- extra step {n} ---")
-        if click_text(page, "Yes, This Is Correct"):
-            time.sleep(6)
-            snap(page, f"{acc['username']}_x{n}_confirm")
-            continue
-        fill_label(page, "username", acc["username"])
-        fill_label(page, "password", acc["password"])
-        fill_label(page, "email", acc["email"])
-        check_label(page, "terms")
-        snap(page, f"{acc['username']}_x{n}_filled")
-        if not click_text(page, "Continue"):
-            break
-        time.sleep(7)
-        print(f"  after step{n} url:", page.url)
-        dump_fields(page, f"after{n}")
-
     body = page.content().lower()
-    for bad in ("already taken", "already exists", "not available", "invalid",
-                "required", "error", "verify"):
-        if bad in body:
-            print(f"  page mentions: {bad}")
+    if "not valid" in body or "creation failed" in body:
+        print("  >>> EMAIL REJECTED BY SITE")
+        return "bad_email"
+    if "already taken" in body:
+        print("  >>> username taken")
+        return "failed"
 
     print("  waiting for email...")
     link = wait_for_link(acc["email"], acc["mail_token"], timeout=180)
     if not link:
         print("  no email")
-        return False
+        return "failed"
     print("  link:", link[:80])
     page.goto(link, wait_until="domcontentloaded", timeout=90000)
     time.sleep(3)
     print("  activated")
-    return True
+    return "ok"
 
 def main():
     results = []
@@ -625,25 +574,44 @@ def main():
         )
         page = ctx.new_page()
 
+        domains = [MAIL_DOMAIN] if MAIL_DOMAIN else mail_domains()
+        print("mail domains to try:", domains)
+        if not domains:
+            domains = [None]
+
         for i in range(COUNT):
             print(f"[{i+1}/{COUNT}] start")
-            acc = {"username": random_username(), "password": random_password()}
-            acc["email"], acc["mail_token"] = create_inbox()
-            print("  email:", acc["email"])
-            try:
-                acc["status"] = "ok" if one_account(page, acc) else "failed"
-            except PWTimeout as e:
-                print("  timeout:", e); acc["status"] = "timeout"
-            except Exception as e:
-                print("  error:", repr(e)); acc["status"] = "error"
+            for dom in domains:
+                acc = {"username": random_username(), "password": random_password()}
+                try:
+                    acc["email"], acc["mail_token"] = create_inbox(dom)
+                except Exception as e:
+                    print("  inbox failed:", e)
+                    continue
+                print("  trying email:", acc["email"])
 
-            results.append(acc)
-            push({k: acc[k] for k in ("username", "password", "email", "status")})
-            with open(OUT, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
-                                   extrasaction="ignore")
-                w.writeheader(); w.writerows(results)
-            print(f"  -> {acc['username']} [{acc['status']}]")
+                try:
+                    status = one_account(page, acc)
+                except PWTimeout as e:
+                    print("  timeout:", e); status = "timeout"
+                except Exception as e:
+                    print("  error:", repr(e)); status = "error"
+
+                acc["status"] = status
+                results.append(acc)
+                push({k: acc[k] for k in ("username", "password", "email", "status")})
+                with open(OUT, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
+                                       extrasaction="ignore")
+                    w.writeheader(); w.writerows(results)
+                print(f"  -> {acc['username']} [{status}]")
+
+                if status == "ok":
+                    break
+                if status != "bad_email":
+                    break
+                print("  domain rejected, trying next...")
+                time.sleep(3)
             time.sleep(PAUSE)
 
         browser.close()
