@@ -594,6 +594,7 @@ def main():
 
         browser.close()
     print("done:", OUT)
-
+from emailer import (create_inbox, fetch_messages, wait_for_link,
+                     wait_for_code, wait_gmail, list_domains, list_mailboxes)
 if __name__ == "__main__":
     main()
