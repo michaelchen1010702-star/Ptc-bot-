@@ -12,7 +12,6 @@ COUNT      = int(os.getenv("COUNT", "1"))
 PAUSE      = 8
 OUT        = "accounts.csv"
 DBG        = "debug"
-MAIL_DOMAIN = os.getenv("MAIL_DOMAIN", "")
 
 SHEETS_URL   = os.getenv("SHEETS_URL", "")
 SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
@@ -20,6 +19,8 @@ SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
 SYMBOLS = "!@#$%^&*"
 WORDS = ["ash","misty","brock","pika","gengar","eevee","snorlax","gyara",
          "dragon","mewtwo","lapras","zapdos","onix","psy","golem","machop"]
+
+PROVIDERS = ["https://api.mail.tm", "https://api.mail.gw"]
 
 os.makedirs(DBG, exist_ok=True)
 
@@ -66,28 +67,6 @@ def page_text(page):
     except Exception:
         pass
 
-def dump_frames(page):
-    print("  --- frames ---")
-    for fr in all_frames(page):
-        try:
-            n = len(fr.query_selector_all("input, select, button, iframe"))
-            print("    frame:", (fr.url or "")[:100], "| elements=", n)
-        except Exception:
-            pass
-
-def dump_fields(page, tag=""):
-    print(f"  --- fields {tag} ---")
-    for fr in all_frames(page):
-        for el in fr.query_selector_all("input, select, button"):
-            try:
-                t = el.evaluate("e => e.tagName.toLowerCase()")
-                txt = (el.inner_text() or "").strip()[:30]
-                print("   ", t, "name=", el.get_attribute("name"),
-                      "id=", el.get_attribute("id"),
-                      "type=", el.get_attribute("type"), "text=", txt)
-            except Exception:
-                pass
-
 def dump_errors(page):
     for fr in all_frames(page):
         try:
@@ -120,37 +99,40 @@ def random_password():
     random.shuffle(pw)
     return "".join(pw)
 
-# ---------------------------------------------------------------- mail.tm
-MAIL = "https://api.mail.tm"
+# ------------------------------------------------------------- mailboxes
+def list_mailboxes():
+    """Return a list of (provider_base_url, domain)."""
+    out = []
+    for base in PROVIDERS:
+        try:
+            r = requests.get(f"{base}/domains", timeout=20).json()
+            ds = [d["domain"] for d in r.get("hydra:member", [])]
+            print(f"  {base}: {ds}")
+            for d in ds:
+                out.append((base, d))
+        except Exception as e:
+            print(f"  {base} failed:", e)
+    return out
 
-def mail_domains():
-    try:
-        r = requests.get(f"{MAIL}/domains", timeout=20).json()
-        return [d["domain"] for d in r.get("hydra:member", [])]
-    except Exception as e:
-        print("  domain list failed:", e)
-        return []
-
-def create_inbox(domain=None):
-    if not domain:
-        ds = mail_domains()
-        domain = ds[0] if ds else None
-    if not domain:
-        raise RuntimeError("no mail.tm domain available")
+def create_inbox(base, domain):
     addr = "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "@" + domain
     pw = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-    requests.post(f"{MAIL}/accounts", json={"address": addr, "password": pw},
+    requests.post(f"{base}/accounts", json={"address": addr, "password": pw},
                   timeout=20).raise_for_status()
-    tok = requests.post(f"{MAIL}/token", json={"address": addr, "password": pw},
+    tok = requests.post(f"{base}/token", json={"address": addr, "password": pw},
                         timeout=20).json()["token"]
-    return addr, tok
+    return addr, tok, base
 
-def wait_for_link(addr, tok, timeout=180):
+def wait_for_link(addr, tok, base, timeout=180):
     h = {"Authorization": f"Bearer {tok}"}
     end = time.time() + timeout
     seen = 0
     while time.time() < end:
-        r = requests.get(f"{MAIL}/messages", headers=h, timeout=20)
+        try:
+            r = requests.get(f"{base}/messages", headers=h, timeout=20)
+        except Exception:
+            time.sleep(5)
+            continue
         if r.status_code == 200:
             msgs = r.json().get("hydra:member", [])
             if len(msgs) != seen:
@@ -160,7 +142,7 @@ def wait_for_link(addr, tok, timeout=180):
                 frm = (m.get("from") or {}).get("address", "").lower()
                 subj = (m.get("subject") or "")[:60]
                 print(f"    msg from={frm} subj={subj}")
-                full = requests.get(f"{MAIL}/messages/{m['id']}", headers=h,
+                full = requests.get(f"{base}/messages/{m['id']}", headers=h,
                                     timeout=20).json()
                 html = full.get("html") or []
                 body = " ".join(html) if isinstance(html, list) else str(html)
@@ -470,8 +452,6 @@ def one_account(page, acc):
         print("  goto failed:", e)
     time.sleep(8)
     print("  landed on:", page.url)
-    page_text(page)
-    snap(page, f"{acc['username']}_1_landed")
 
     for attempt in range(3):
         state = wait_for_ready(page, 45)
@@ -493,7 +473,6 @@ def one_account(page, acc):
         snap(page, f"{acc['username']}_nofields")
         return "failed"
 
-    # ---- STEP 1: age gate ----
     set_select(page, "country", COUNTRY)
     set_select(page, "year", str(DOB_YEAR))
     set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
@@ -502,18 +481,16 @@ def one_account(page, acc):
     click_text(page, "Continue")
     time.sleep(5)
 
-    # ---- STEP 2: confirm birthdate ----
     if click_text(page, "Yes, This Is Correct"):
         print("  birthdate confirmed")
         time.sleep(6)
 
-    # ---- STEP 3: account details ----
     for _ in range(4):
         if find_any(page, 'input[name="username"]'):
             break
         time.sleep(5)
 
-    snap(page, f"{acc['username']}_5_account")
+    snap(page, f"{acc['username']}_account")
 
     r = {}
     r["username"] = fill_label(page, "username", acc["username"])
@@ -536,7 +513,7 @@ def one_account(page, acc):
     print("  after submit url:", page.url)
     page_text(page)
     dump_errors(page)
-    snap(page, f"{acc['username']}_7_afterdetails")
+    snap(page, f"{acc['username']}_submitted")
 
     body = page.content().lower()
     if "not valid" in body or "creation failed" in body:
@@ -547,7 +524,7 @@ def one_account(page, acc):
         return "failed"
 
     print("  waiting for email...")
-    link = wait_for_link(acc["email"], acc["mail_token"], timeout=180)
+    link = wait_for_link(acc["email"], acc["mail_token"], acc["mail_base"], timeout=180)
     if not link:
         print("  no email")
         return "failed"
@@ -574,19 +551,20 @@ def main():
         )
         page = ctx.new_page()
 
-        domains = [MAIL_DOMAIN] if MAIL_DOMAIN else mail_domains()
-        print("mail domains to try:", domains)
-        if not domains:
-            domains = [None]
+        boxes = list_mailboxes()
+        print("mailboxes to try:", boxes)
+        if not boxes:
+            print("NO MAIL DOMAINS AVAILABLE")
+            return
 
         for i in range(COUNT):
             print(f"[{i+1}/{COUNT}] start")
-            for dom in domains:
+            for base, domain in boxes:
                 acc = {"username": random_username(), "password": random_password()}
                 try:
-                    acc["email"], acc["mail_token"] = create_inbox(dom)
+                    acc["email"], acc["mail_token"], acc["mail_base"] = create_inbox(base, domain)
                 except Exception as e:
-                    print("  inbox failed:", e)
+                    print("  inbox failed:", base, domain, e)
                     continue
                 print("  trying email:", acc["email"])
 
