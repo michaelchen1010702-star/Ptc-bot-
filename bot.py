@@ -104,6 +104,23 @@ def dump_select_options(page):
             except Exception:
                 pass
 
+# ------------------------------------------------------------ Edit A: error reader
+def dump_errors(page):
+    for fr in all_frames(page):
+        try:
+            msgs = fr.evaluate("""() => {
+                const out = [];
+                document.querySelectorAll('[class*=error],[class*=invalid],[role=alert],[aria-live]').forEach(e => {
+                    const t = (e.innerText || '').trim();
+                    if (t && t.length < 200) out.push(t);
+                });
+                return out;
+            }""")
+            for m in msgs:
+                print("    error box:", repr(m[:160]))
+        except Exception:
+            pass
+
 # ------------------------------------------------------------ account gen
 def random_username():
     base = random.choice(WORDS) + random.choice(WORDS)
@@ -504,23 +521,51 @@ def one_account(page, acc):
     snap(page, f"{acc['username']}_5_account")
     dump_fields(page, "account")
 
+    # ---- Edit B: enhanced submit block ----
     r = {}
     r["username"] = fill_label(page, "username", acc["username"])
     r["password"] = fill_label(page, "password", acc["password"])
     r["email"]    = fill_label(page, "email", acc["email"])
     print("  filled:", r)
 
+    for _ in range(3):
+        try:
+            page.keyboard.press("Tab")
+            time.sleep(0.3)
+        except Exception:
+            pass
+
     ticked = check_label(page, "terms") or check_label(page, "agree")
     print("  terms ticked:", ticked)
-    time.sleep(1)
 
+    for name in ("username", "password", "email"):
+        el = find_any(page, f'input[name="{name}"]')
+        if el:
+            try:
+                print(f"    value[{name}] =", repr(el.input_value()))
+            except Exception:
+                pass
+
+    try:
+        print("  invalid field present:", bool(find_any(page, "input:invalid")))
+    except Exception:
+        pass
+
+    time.sleep(1)
     snap(page, f"{acc['username']}_6_account_filled")
 
     click_text(page, "Continue")
     time.sleep(8)
     print("  after details url:", page.url)
+    page_text(page)
+    dump_errors(page)
+    tok = find_any(page, 'input[id="recaptcha-token"]')
+    if tok:
+        try:
+            print("  recaptcha token length:", len(tok.input_value() or ""))
+        except Exception:
+            pass
     snap(page, f"{acc['username']}_7_afterdetails")
-    dump_fields(page, "afterdetails")
 
     # ---- any remaining steps ----
     for n in range(2, 7):
