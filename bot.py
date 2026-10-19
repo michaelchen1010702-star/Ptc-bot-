@@ -104,7 +104,7 @@ def dump_select_options(page):
             except Exception:
                 pass
 
-# ------------------------------------------------------------ Edit A: error reader
+# ------------------------------------------------------------ Error reader
 def dump_errors(page):
     for fr in all_frames(page):
         try:
@@ -127,13 +127,17 @@ def random_username():
     tail = "".join(random.choices(string.digits, k=random.randint(2, 5)))
     return (base + tail)[:16]
 
+SYMBOLS = "!@#$%^&*"
+
 def random_password():
-    pw = list(random.choice(string.ascii_uppercase)
-              + "".join(random.choices(string.ascii_lowercase, k=6))
-              + random.choice(string.digits)
-              + "".join(random.choices(string.ascii_letters + string.digits, k=4)))
+    lower = random.choice(string.ascii_lowercase)
+    upper = random.choice(string.ascii_uppercase)
+    digit = random.choice(string.digits)
+    sym = random.choice(SYMBOLS)
+    rest = "".join(random.choices(string.ascii_letters + string.digits, k=8))
+    pw = list(lower + upper + digit + sym + rest)
     random.shuffle(pw)
-    return "".join(pw)[:16]
+    return "".join(pw)
 
 # ---------------------------------------------------------------- mail.tm
 MAIL = "https://api.mail.tm"
@@ -521,7 +525,7 @@ def one_account(page, acc):
     snap(page, f"{acc['username']}_5_account")
     dump_fields(page, "account")
 
-    # ---- Edit B: enhanced submit block ----
+    # ---- Submit block with debugging ----
     r = {}
     r["username"] = fill_label(page, "username", acc["username"])
     r["password"] = fill_label(page, "password", acc["password"])
