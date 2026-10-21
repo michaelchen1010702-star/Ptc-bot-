@@ -1,26 +1,27 @@
 """
-emailer.py -- free disposable-inbox layer for the PTC bot.
+emailer.py -- disposable-inbox layer for the PTC bot.
 
-Matches the exact interface bot.py calls:
+Interface, matching exactly what bot.py calls:
     list_mailboxes()                        -> [(base, domain), ...]
     create_inbox(base, domain)              -> (address, token, base)
     wait_for_link(address, token, base, t)  -> url | None
 
-Providers, in try-order (bot rotates on 'bad_email'):
-    maildrop    maildrop.cc      GraphQL API, no signup
-    guerrilla   10 domains       ajax API, no signup
-    mailtm      maxxspace.com    REST API
-    mailgw      mail.gw          REST API (same shape as mail.tm)
-    gmail       gmail.com        dot-trick, needs secrets (optional)
+bot.py rotates to the next (base, domain) every time Pokemon answers
+'email not valid', so the length of this list is how many shots you get
+at beating the blocklist.
+
+Providers: maildrop, guerrilla (10 domains), yopmail (13 domains),
+tempmail.lol, mail.tm, mail.gw, gmail (optional, last).
 
 Env knobs:
-    DOMAIN_BLOCK=maxxspace.com,sharklasers.com    skip these
-    EMAIL_PROVIDER=guerrilla                      only this provider
-    DOMAIN_ORDER=gmail.com,maildrop.cc            try these first
+    DOMAIN_ORDER=grr.la,maildrop.cc    try these first
+    DOMAIN_BLOCK=sharklasers.com       never use these
+    EMAIL_PROVIDER=yopmail             only this provider
 
 Probe:  python emailer.py
 """
 
+import http.cookiejar
 import json
 import os
 import random
@@ -35,22 +36,30 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 TM = {"mailtm": "https://api.mail.tm", "mailgw": "https://api.mail.gw"}
 GM = "https://api.guerrillamail.com/ajax.php"
 MD = "https://api.maildrop.cc/graphql"
+TMP = "https://api.tempmail.lol/v2"
 
-# Guerrilla aliases every one of these to the same mailbox.
+# Guerrilla aliases all of these to one mailbox.
 GM_DOMAINS = ["guerrillamailblock.com", "sharklasers.com", "grr.la",
               "guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
               "guerrillamail.biz", "guerrillamail.de", "spam4.me",
               "pokemail.net"]
 
+# YOPmail aliases all of these to one mailbox too.
+YOP_DOMAINS = ["yopmail.com", "yopmail.fr", "yopmail.net", "cool.fr.nf",
+               "jetable.fr.nf", "nospam.ze.tc", "nomail.xl.cx", "mega.zik.dj",
+               "speed.1s.fr", "courriel.fr.nf", "moncourrier.fr.nf",
+               "monemail.fr.nf", "monmail.fr.nf"]
+
 
 # ------------------------------------------------------------------ plumbing
 
-def _get(url, headers=None, timeout=30):
+def _open(url, headers=None, timeout=30, opener=None):
     h = {"User-Agent": UA, "Accept": "application/json"}
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, headers=h)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    op = opener or urllib.request.build_opener()
+    with op.open(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
 
@@ -105,32 +114,75 @@ def _md_links(mailbox):
 
 def _gm_create(domain):
     u = "ptc" + _rand(8)
-    j0 = _j(_get("%s?f=get_email_address&site=%s" % (GM, domain))) or {}
+    j0 = _j(_open("%s?f=get_email_address&site=%s" % (GM, domain))) or {}
     sid = j0.get("sid_token") or ""
     if not sid:
         raise RuntimeError("guerrilla: no session")
-    _get("%s?f=set_email_user&email_user=%s&sid_token=%s&site=%s"
-         % (GM, u, sid, domain))
+    _open("%s?f=set_email_user&email_user=%s&sid_token=%s&site=%s"
+          % (GM, u, sid, domain))
     return "%s@%s" % (u, domain), sid
 
 
 def _gm_links(sid):
-    j = _j(_get("%s?f=check_email&seq=0&sid_token=%s" % (GM, sid))) or {}
+    j = _j(_open("%s?f=check_email&seq=0&sid_token=%s" % (GM, sid))) or {}
     out = []
     for m in j.get("list") or []:
         body = m.get("mail_body") or ""
         if not body and m.get("mail_id"):
-            d = _j(_get("%s?f=fetch_email&email_id=%s&sid_token=%s"
-                        % (GM, m["mail_id"], sid))) or {}
+            d = _j(_open("%s?f=fetch_email&email_id=%s&sid_token=%s"
+                         % (GM, m["mail_id"], sid))) or {}
             body = d.get("mail_body") or ""
         out += _links((m.get("mail_excerpt") or "") + "\n" + body)
+    return out
+
+
+# ------------------------------------------------------------------ yopmail
+
+def _yop_links(login):
+    jar = http.cookiejar.CookieJar()
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    op.open(urllib.request.Request("https://yopmail.com/en/?login=" + login,
+                                   headers={"User-Agent": UA}), timeout=30).read()
+    html = _open("https://yopmail.com/en/inc/inbox.html?login=" + login,
+                 opener=op)
+    out = []
+    ids = re.findall(r'id="(m\d+)"', html) or re.findall(r'id="([a-z]+\d+)"', html)
+    for mid in dict.fromkeys(ids):
+        try:
+            body = _open("https://yopmail.com/en/inc/mail.html?login=%s&id=%s"
+                         % (login, mid), opener=op)
+        except Exception:
+            continue
+        out += _links(body)
+    if not out:
+        try:
+            out += _links(_open("https://yopmail.com/en/rss.php?login=" + login))
+        except Exception:
+            pass
+    return out
+
+
+# --------------------------------------------------------------- tempmail.lol
+
+def _tmp_create():
+    j = _j(_post(TMP + "/inbox/create", {})) or {}
+    if not j.get("address"):
+        raise RuntimeError("tempmail: %s" % j)
+    return j["address"], j["token"]
+
+
+def _tmp_links(token):
+    j = _j(_open("%s/inbox?token=%s" % (TMP, token))) or {}
+    out = []
+    for m in j.get("emails") or []:
+        out += _links((m.get("body") or "") + "\n" + (m.get("html") or ""))
     return out
 
 
 # ------------------------------------------------------------------- mail.tm
 
 def _tm_domains(base):
-    txt = _get(base + "/domains")
+    txt = _open(base + "/domains")
     j = _j(txt)
     if j is None:                                   # XML fallback
         return re.findall(r"<domain>([^<]+)</domain>", txt)
@@ -140,15 +192,11 @@ def _tm_domains(base):
             if isinstance(j.get(k), list):
                 rows = j[k]
                 break
-    if not rows:
-        return []
     out = []
-    for d in rows:
-        if not isinstance(d, dict) or not d.get("domain"):
-            continue
-        if str(d.get("isActive", 1)).lower() in ("0", "false"):
-            continue
-        out.append(d["domain"])
+    for d in rows or []:
+        if isinstance(d, dict) and d.get("domain") \
+                and str(d.get("isActive", 1)).lower() not in ("0", "false"):
+            out.append(d["domain"])
     return out
 
 
@@ -163,11 +211,11 @@ def _tm_create(base, address, password):
 
 def _tm_links(base, token):
     auth = {"Authorization": "Bearer " + token}
-    j = _j(_get(base + "/messages", auth))
+    j = _j(_open(base + "/messages", auth))
     msgs = j if isinstance(j, list) else (j or {}).get("hydra:member", [])
     out = []
     for m in msgs or []:
-        d = _j(_get(base + "/messages/" + m["id"], auth)) or {}
+        d = _j(_open(base + "/messages/" + m["id"], auth)) or {}
         html = d.get("html") or []
         body = "\n".join(html) if isinstance(html, list) else str(html)
         out += _links(body + "\n" + (d.get("text") or ""))
@@ -177,8 +225,7 @@ def _tm_links(base, token):
 # --------------------------------------------------------------------- gmail
 
 def _gmail_addr(domain):
-    u = os.getenv("GMAIL_USER", "").strip()
-    local = u.split("@", 1)[0]
+    local = os.getenv("GMAIL_USER", "").strip().split("@", 1)[0]
     if len(local) < 2:
         return "%s+ptc%s@%s" % (local, _rand(6), domain)
     parts = [local[0]]
@@ -190,7 +237,6 @@ def _gmail_addr(domain):
 def _gmail_links(address):
     import email as _email
     import imaplib
-    from email.header import decode_header
 
     out = []
     M = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -234,8 +280,12 @@ def _domains(tag):
         return _tm_domains(TM[tag])
     if tag == "guerrilla":
         return list(GM_DOMAINS)
+    if tag == "yopmail":
+        return list(YOP_DOMAINS)
     if tag == "maildrop":
         return ["maildrop.cc"]
+    if tag == "tempmail":
+        return ["auto"]
     if tag == "gmail":
         u = os.getenv("GMAIL_USER", "").strip()
         if "@" in u and os.getenv("GMAIL_APP_PASSWORD"):
@@ -248,7 +298,8 @@ def list_mailboxes():
     want = os.getenv("EMAIL_PROVIDER", "").strip().lower()
     bad = _blocked()
     out = []
-    for tag in ("maildrop", "guerrilla", "mailtm", "mailgw", "gmail"):
+    for tag in ("maildrop", "guerrilla", "yopmail", "tempmail", "mailtm",
+                "mailgw", "gmail"):
         if want and tag != want:
             continue
         try:
@@ -273,6 +324,11 @@ def create_inbox(base, domain):
     if base == "guerrilla":
         addr, sid = _gm_create(domain)
         return addr, sid, base
+    if base == "yopmail":
+        return "ptc%s@%s" % (_rand(9), domain), _rand(9), base
+    if base == "tempmail":
+        addr, tok = _tmp_create()
+        return addr, tok, base
     if base in TM:
         addr = "ptc%s@%s" % (_rand(8), domain)
         return addr, _tm_create(TM[base], addr, _rand(12) + "Aa1!"), base
@@ -286,6 +342,10 @@ def _poll(base, address, token):
         return _md_links(address.split("@")[0])
     if base == "guerrilla":
         return _gm_links(token)
+    if base == "yopmail":
+        return _yop_links(address.split("@")[0])
+    if base == "tempmail":
+        return _tmp_links(token)
     if base in TM:
         return _tm_links(TM[base], token)
     if base == "gmail":
@@ -294,13 +354,12 @@ def _poll(base, address, token):
 
 
 SKIP = ("facebook", "twitter", "instagram", "youtube", "unsubscribe",
-        "privacy", "terms", "help.guerrillamail")
+        "privacy", "terms", "guerrillamail", "yopmail.com/en")
 
 
 def wait_for_link(address, token, base, timeout=180):
     end = time.time() + timeout
-    seen = set()
-    fallback = None
+    seen, fallback = set(), None
     while time.time() < end:
         try:
             links = _poll(base, address, token)
@@ -329,7 +388,8 @@ def wait_for_link(address, token, base, timeout=180):
 
 def domain_probe():
     out = {}
-    for tag in ("maildrop", "guerrilla", "mailtm", "mailgw", "gmail"):
+    for tag in ("maildrop", "guerrilla", "yopmail", "tempmail", "mailtm",
+                "mailgw", "gmail"):
         try:
             out[tag] = _domains(tag)
         except Exception as e:
@@ -344,12 +404,12 @@ wait_code = wait_for_link
 
 
 if __name__ == "__main__":
-    print("--- reachable domains ---")
+    print("--- candidate domains ---")
     total = 0
     for name, doms in domain_probe().items():
         print("%-10s %s" % (name, doms if doms else "(not configured)"))
         total += len(doms)
-    print("total candidate domains:", total)
+    print("total:", total)
     try:
         base, domain = list_mailboxes()[0]
         addr, tok, base = create_inbox(base, domain)
