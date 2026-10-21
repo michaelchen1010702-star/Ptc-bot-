@@ -371,6 +371,22 @@ def blocked_page(page):
     except Exception:
         return False
 
+def wait_for_imperva_cookie(page, timeout=25):
+    """Let Imperva's reese84 / incap challenge finish before we submit."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            names = {c.get("name", "") for c in page.context.cookies()}
+        except Exception:
+            names = set()
+        if any(n.startswith(("reese84", "visid_incap", "incap_ses", "nlbi"))
+               for n in names):
+            print("  imperva cookie present")
+            return True
+        time.sleep(1)
+    print("  no imperva cookie yet")
+    return False
+
 def fill_label(page, label, value):
     """Type the value with real keystrokes - Imperva watches keydown/keyup."""
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
@@ -480,9 +496,29 @@ def push(row):
         print("  sheet error:", e)
 
 # ------------------------------------------------------------------ main
+def launch_browser(p):
+    """Real Chrome first - Playwright's Chromium has no window.chrome.runtime."""
+    args = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--lang=en-US",
+    ]
+    err = None
+    for kw in ({"channel": "chrome"}, {}):
+        try:
+            b = p.chromium.launch(headless=False, args=args, **kw)
+            print("  browser:", kw.get("channel", "bundled chromium"))
+            return b
+        except Exception as e:
+            print("  launch failed:", kw.get("channel", "chromium"), e)
+            err = e
+    raise err
+
 def one_account(page, acc):
     """Fill and submit the signup, retrying the whole thing if Imperva blocks."""
-    for attempt in range(3):
+    for attempt in range(4):
         print(f"  --- attempt {attempt + 1} ---")
         try:
             page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
@@ -510,6 +546,7 @@ def one_account(page, acc):
             snap(page, f"{acc['username']}_nofields")
             return "failed"
 
+        wait_for_imperva_cookie(page, 20)
         human_warmup(page, 2.5)
 
         set_select(page, "country", COUNTRY)
@@ -568,8 +605,21 @@ def one_account(page, acc):
         snap(page, f"{acc['username']}_submitted")
 
         if blocked_page(page):
-            print("  >>> IMPERVA BLOCK, retrying")
-            time.sleep(6)
+            print("  >>> IMPERVA BLOCK")
+            # the POST may still have landed - give the inbox a short look
+            link = wait_for_link(acc["email"], acc["mail_token"],
+                                 acc["mail_base"], timeout=35)
+            if link:
+                print("  link:", link[:80])
+                page.goto(link, wait_until="domcontentloaded", timeout=90000)
+                time.sleep(3)
+                print("  activated")
+                return "ok"
+            try:
+                page.context.clear_cookies()
+            except Exception:
+                pass
+            time.sleep(random.uniform(18, 28))
             continue
 
         body = page.content().lower()
@@ -597,19 +647,22 @@ def one_account(page, acc):
 def main():
     results = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, args=[
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-        ])
+        browser = launch_browser(p)
         ctx = browser.new_context(
             viewport={"width": 1366, "height": 900},
             locale="en-US",
+            timezone_id="America/New_York",
         )
-        ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-        )
+        ctx.add_init_script("""
+            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+            window.chrome = window.chrome || {};
+            window.chrome.runtime = window.chrome.runtime || {};
+        """)
         page = ctx.new_page()
+        try:
+            print("  ua:", page.evaluate("navigator.userAgent"))
+        except Exception:
+            pass
 
         boxes = list_mailboxes()
         print("mailboxes to try:", boxes)
