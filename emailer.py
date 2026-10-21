@@ -416,3 +416,26 @@ if __name__ == "__main__":
         print("test inbox: %s  [provider=%s]" % (addr, base))
     except Exception as e:
         print("test inbox FAILED:", e)
+# ---- appended: bot.py also imports fetch_messages ----
+def fetch_messages(inbox, token=None, base=None):
+    if isinstance(inbox, dict):
+        base = inbox.get("provider") or inbox.get("base") or ""
+        token = inbox.get("token")
+        inbox = inbox.get("address") or ""
+    return _poll(base, inbox, token)
+
+
+# ---- appended: try the fresh mail.gw domain first, then sweep the rest ----
+_DEFAULT_ORDER = "westcast-systems.com"
+_orig_list_mailboxes = list_mailboxes
+
+
+def list_mailboxes():
+    boxes = _orig_list_mailboxes()
+    pref = [d.strip().lower()
+            for d in os.getenv("DOMAIN_ORDER", _DEFAULT_ORDER).split(",")
+            if d.strip()]
+    if pref:
+        boxes.sort(key=lambda t: pref.index(t[1].lower())
+                   if t[1].lower() in pref else 99)
+    return boxes
