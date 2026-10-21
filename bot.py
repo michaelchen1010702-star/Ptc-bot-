@@ -12,6 +12,7 @@ COUNT      = int(os.getenv("COUNT", "1"))
 PAUSE      = 8
 OUT        = "accounts.csv"
 DBG        = "debug"
+PROFILE    = "/tmp/ptcprofile"
 
 SHEETS_URL   = os.getenv("SHEETS_URL", "")
 SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
@@ -58,6 +59,12 @@ def find_any(page, selector):
         except Exception:
             pass
     return None
+
+def cookie_names(page):
+    try:
+        return sorted({c.get("name", "") for c in page.context.cookies()})
+    except Exception:
+        return []
 
 def page_text(page):
     try:
@@ -371,20 +378,17 @@ def blocked_page(page):
     except Exception:
         return False
 
-def wait_for_imperva_cookie(page, timeout=25):
-    """Let Imperva's reese84 / incap challenge finish before we submit."""
+def wait_for_reese(page, timeout=30):
+    """reese84 is the ONLY Imperva cookie that matters for a POST.
+    nlbi_* and visid_incap_* are set on every response and mean nothing."""
     end = time.time() + timeout
     while time.time() < end:
-        try:
-            names = {c.get("name", "") for c in page.context.cookies()}
-        except Exception:
-            names = set()
-        if any(n.startswith(("reese84", "visid_incap", "incap_ses", "nlbi"))
-               for n in names):
-            print("  imperva cookie present")
+        names = cookie_names(page)
+        if any(n.startswith("reese84") for n in names):
+            print("  reese84 present")
             return True
         time.sleep(1)
-    print("  no imperva cookie yet")
+    print("  no reese84 after %ds - cookies: %s" % (timeout, cookie_names(page)))
     return False
 
 def fill_label(page, label, value):
@@ -496,8 +500,8 @@ def push(row):
         print("  sheet error:", e)
 
 # ------------------------------------------------------------------ main
-def launch_browser(p):
-    """Real Chrome first - Playwright's Chromium has no window.chrome.runtime."""
+def launch(p):
+    """Real Chrome, persistent profile, automation flag removed."""
     args = [
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
@@ -505,16 +509,22 @@ def launch_browser(p):
         "--disable-features=IsolateOrigins,site-per-process",
         "--lang=en-US",
     ]
-    err = None
-    for kw in ({"channel": "chrome"}, {}):
+    common = dict(headless=False, args=args,
+                  viewport={"width": 1366, "height": 900},
+                  locale="en-US",
+                  timezone_id="America/New_York")
+    for kw in ({"channel": "chrome", "ignore_default_args": ["--enable-automation"]},
+               {"channel": "chrome"},
+               {}):
+        label = (kw.get("channel", "bundled chromium")
+                 + ("+noautomation" if "ignore_default_args" in kw else ""))
         try:
-            b = p.chromium.launch(headless=False, args=args, **kw)
-            print("  browser:", kw.get("channel", "bundled chromium"))
-            return b
+            ctx = p.chromium.launch_persistent_context(PROFILE, **common, **kw)
+            print("  browser:", label)
+            return ctx
         except Exception as e:
-            print("  launch failed:", kw.get("channel", "chromium"), e)
-            err = e
-    raise err
+            print("  launch failed:", label, e)
+    raise RuntimeError("no browser would launch")
 
 def one_account(page, acc):
     """Fill and submit the signup, retrying the whole thing if Imperva blocks."""
@@ -546,7 +556,16 @@ def one_account(page, acc):
             snap(page, f"{acc['username']}_nofields")
             return "failed"
 
-        wait_for_imperva_cookie(page, 20)
+        # the challenge script needs to actually hand us reese84 before we POST
+        if not wait_for_reese(page, 25):
+            print("  reloading to re-run the challenge")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                print("  reload failed:", e)
+            time.sleep(6)
+            wait_for_reese(page, 20)
+
         human_warmup(page, 2.5)
 
         set_select(page, "country", COUNTRY)
@@ -598,6 +617,8 @@ def one_account(page, acc):
             time.sleep(1)
         time.sleep(random.uniform(2.0, 3.5))
 
+        print("  cookies before submit:", cookie_names(page))
+
         click_text(page, "Continue", pause=(6, 8))
         print("  after submit url:", page.url)
         page_text(page)
@@ -605,8 +626,7 @@ def one_account(page, acc):
         snap(page, f"{acc['username']}_submitted")
 
         if blocked_page(page):
-            print("  >>> IMPERVA BLOCK")
-            # the POST may still have landed - give the inbox a short look
+            print("  >>> IMPERVA BLOCK - cookies were:", cookie_names(page))
             link = wait_for_link(acc["email"], acc["mail_token"],
                                  acc["mail_base"], timeout=35)
             if link:
@@ -615,10 +635,6 @@ def one_account(page, acc):
                 time.sleep(3)
                 print("  activated")
                 return "ok"
-            try:
-                page.context.clear_cookies()
-            except Exception:
-                pass
             time.sleep(random.uniform(18, 28))
             continue
 
@@ -647,18 +663,13 @@ def one_account(page, acc):
 def main():
     results = []
     with sync_playwright() as p:
-        browser = launch_browser(p)
-        ctx = browser.new_context(
-            viewport={"width": 1366, "height": 900},
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
+        ctx = launch(p)
         ctx.add_init_script("""
             Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
             window.chrome = window.chrome || {};
             window.chrome.runtime = window.chrome.runtime || {};
         """)
-        page = ctx.new_page()
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             print("  ua:", page.evaluate("navigator.userAgent"))
         except Exception:
@@ -705,7 +716,7 @@ def main():
                 time.sleep(3)
             time.sleep(PAUSE)
 
-        browser.close()
+        ctx.close()
     print("done:", OUT)
 
 from emailer import (create_inbox, fetch_messages, wait_for_link,
