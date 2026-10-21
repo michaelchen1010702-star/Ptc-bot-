@@ -101,7 +101,7 @@ def random_password():
 
 # ------------------------------------------------------------- mailboxes
 def list_mailboxes():
-    """Return a list of (provider_base_url, domain)."""
+    """Legacy. Overridden by emailer.list_mailboxes on import."""
     out = []
     for base in PROVIDERS:
         try:
@@ -124,6 +124,7 @@ def create_inbox(base, domain):
     return addr, tok, base
 
 def wait_for_link(addr, tok, base, timeout=180):
+    """Legacy. Overridden by emailer.wait_for_link on import."""
     h = {"Authorization": f"Bearer {tok}"}
     end = time.time() + timeout
     seen = 0
@@ -347,15 +348,48 @@ def wait_for_ready(page, timeout=60):
     return "none"
 
 # ------------------------------------------------------------- form fill
+def human_warmup(page, seconds=3.0):
+    """Jiggle the mouse and scroll a bit so Imperva sees activity."""
+    try:
+        w = page.viewport_size or {"width": 1366, "height": 900}
+        end = time.time() + seconds
+        while time.time() < end:
+            page.mouse.move(random.randint(60, w["width"] - 60),
+                            random.randint(60, w["height"] - 60),
+                            steps=random.randint(6, 18))
+            time.sleep(random.uniform(0.15, 0.45))
+        page.mouse.wheel(0, random.randint(80, 260))
+        time.sleep(random.uniform(0.3, 0.7))
+        page.mouse.wheel(0, -random.randint(40, 120))
+    except Exception:
+        pass
+
+def blocked_page(page):
+    """True when Imperva served its 'unusual browsing activity' page."""
+    try:
+        return "apologize for the interruption" in page.inner_text("body").lower()
+    except Exception:
+        return False
+
 def fill_label(page, label, value):
+    """Type the value with real keystrokes - Imperva watches keydown/keyup."""
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
-    for sel in [f'xpath=//label[{xp}]/following::input[1]',
-                f'input[name="{label.lower()}"]',
+    for sel in [f'input[name="{label.lower()}"]',
                 f'input[id*="{label.lower()}"]',
+                f'xpath=//label[{xp}]/following::input[1]',
                 f'input[placeholder*="{label}" i]']:
         el = find_any(page, sel)
-        if el:
+        if not el:
+            continue
+        try:
+            el.click()
+            time.sleep(random.uniform(0.2, 0.5))
+            el.fill("")
+            el.press_sequentially(value, delay=random.randint(55, 135))
+            time.sleep(random.uniform(0.3, 0.8))
+            return True
+        except Exception:
             try:
                 el.fill(value)
                 return True
@@ -417,18 +451,20 @@ def check_label(page, label):
             pass
     return False
 
-def click_text(page, text):
+def click_text(page, text, pause=(3.5, 5.5)):
     for sel in [f'button:has-text("{text}")', f'a:has-text("{text}")',
                 f'input[value*="{text}"]']:
         el = find_any(page, sel)
-        if el:
-            try:
-                el.click()
-                print(f"  clicked: {text}")
-                time.sleep(4)
-                return True
-            except Exception:
-                pass
+        if not el:
+            continue
+        human_warmup(page, 0.8)
+        try:
+            el.click()
+        except Exception:
+            pass
+        time.sleep(random.uniform(*pause))
+        print(f"  clicked: {text}")
+        return True
     return False
 
 # ---------------------------------------------------------------- sheets
@@ -445,94 +481,118 @@ def push(row):
 
 # ------------------------------------------------------------------ main
 def one_account(page, acc):
-    print("  goto:", SIGNUP_URL)
-    try:
-        page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
-    except Exception as e:
-        print("  goto failed:", e)
-    time.sleep(8)
-    print("  landed on:", page.url)
-
+    """Fill and submit the signup, retrying the whole thing if Imperva blocks."""
     for attempt in range(3):
-        state = wait_for_ready(page, 45)
-        print(f"  round {attempt}: state={state}")
-        if state == "form":
-            break
-        if state == "captcha":
-            try:
-                solve_any(page, wait=4)
-                print("  captcha solved")
-            except CaptchaFail as e:
-                print("  captcha fail:", e)
-            time.sleep(4)
-            continue
-        time.sleep(8)
-
-    if field_count(page) == 0:
-        print("  still no form")
-        snap(page, f"{acc['username']}_nofields")
-        return "failed"
-
-    set_select(page, "country", COUNTRY)
-    set_select(page, "year", str(DOB_YEAR))
-    set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
-    set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
-    time.sleep(2)
-    click_text(page, "Continue")
-    time.sleep(5)
-
-    if click_text(page, "Yes, This Is Correct"):
-        print("  birthdate confirmed")
-        time.sleep(6)
-
-    for _ in range(4):
-        if find_any(page, 'input[name="username"]'):
-            break
-        time.sleep(5)
-
-    snap(page, f"{acc['username']}_account")
-
-    r = {}
-    r["username"] = fill_label(page, "username", acc["username"])
-    r["password"] = fill_label(page, "password", acc["password"])
-    r["email"]    = fill_label(page, "email", acc["email"])
-    print("  filled:", r)
-
-    for _ in range(3):
+        print(f"  --- attempt {attempt + 1} ---")
         try:
-            page.keyboard.press("Tab")
-            time.sleep(0.3)
-        except Exception:
-            pass
+            page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
+        except Exception as e:
+            print("  goto failed:", e)
+        time.sleep(random.uniform(6, 9))
+        print("  landed on:", page.url)
 
-    print("  terms ticked:", check_label(page, "terms"))
-    time.sleep(1)
+        for _ in range(3):
+            state = wait_for_ready(page, 45)
+            print("  state:", state)
+            if state == "form":
+                break
+            if state == "captcha":
+                try:
+                    solve_any(page, wait=4)
+                except CaptchaFail as e:
+                    print("  captcha fail:", e)
+                time.sleep(4)
+                continue
+            time.sleep(8)
 
-    click_text(page, "Continue")
-    time.sleep(8)
-    print("  after submit url:", page.url)
-    page_text(page)
-    dump_errors(page)
-    snap(page, f"{acc['username']}_submitted")
+        if field_count(page) == 0:
+            print("  still no form")
+            snap(page, f"{acc['username']}_nofields")
+            return "failed"
 
-    body = page.content().lower()
-    if "not valid" in body or "creation failed" in body:
-        print("  >>> EMAIL REJECTED BY SITE")
-        return "bad_email"
-    if "already taken" in body:
-        print("  >>> username taken")
-        return "failed"
+        human_warmup(page, 2.5)
 
-    print("  waiting for email...")
-    link = wait_for_link(acc["email"], acc["mail_token"], acc["mail_base"], timeout=180)
-    if not link:
-        print("  no email")
-        return "failed"
-    print("  link:", link[:80])
-    page.goto(link, wait_until="domcontentloaded", timeout=90000)
-    time.sleep(3)
-    print("  activated")
-    return "ok"
+        set_select(page, "country", COUNTRY)
+        set_select(page, "year", str(DOB_YEAR))
+        set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
+        set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
+        time.sleep(random.uniform(1.5, 2.5))
+        click_text(page, "Continue")
+        time.sleep(3)
+
+        if click_text(page, "Yes, This Is Correct"):
+            print("  birthdate confirmed")
+            time.sleep(random.uniform(4, 7))
+
+        for _ in range(4):
+            if find_any(page, 'input[name="username"]'):
+                break
+            time.sleep(4)
+
+        human_warmup(page, 1.5)
+
+        filled = {}
+        filled["username"] = fill_label(page, "username", acc["username"])
+        filled["password"] = fill_label(page, "password", acc["password"])
+        filled["email"]    = fill_label(page, "email", acc["email"])
+        print("  filled:", filled)
+        if not all(filled.values()):
+            print("  field fill failed, retrying page")
+            continue
+
+        for _ in range(3):
+            try:
+                page.keyboard.press("Tab")
+                time.sleep(0.35)
+            except Exception:
+                pass
+
+        print("  terms ticked:", check_label(page, "terms"))
+        time.sleep(1)
+
+        # wait for the invisible reCAPTCHA token to populate before submitting
+        for _ in range(12):
+            tok = find_any(page, 'input[name="recaptcha-token"]')
+            try:
+                if tok and (tok.input_value() or "").strip():
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        time.sleep(random.uniform(2.0, 3.5))
+
+        click_text(page, "Continue", pause=(6, 8))
+        print("  after submit url:", page.url)
+        page_text(page)
+        dump_errors(page)
+        snap(page, f"{acc['username']}_submitted")
+
+        if blocked_page(page):
+            print("  >>> IMPERVA BLOCK, retrying")
+            time.sleep(6)
+            continue
+
+        body = page.content().lower()
+        if "not valid" in body or "creation failed" in body:
+            print("  >>> EMAIL REJECTED BY SITE")
+            return "bad_email"
+        if "already taken" in body:
+            print("  >>> username taken")
+            return "failed"
+
+        print("  waiting for email...")
+        link = wait_for_link(acc["email"], acc["mail_token"], acc["mail_base"],
+                             timeout=150)
+        if not link:
+            print("  no email")
+            return "failed"
+        print("  link:", link[:80])
+        page.goto(link, wait_until="domcontentloaded", timeout=90000)
+        time.sleep(3)
+        print("  activated")
+        return "ok"
+
+    return "failed"
 
 def main():
     results = []
@@ -594,6 +654,7 @@ def main():
 
         browser.close()
     print("done:", OUT)
+
 from emailer import (create_inbox, fetch_messages, wait_for_link,
                      wait_for_code, wait_gmail, list_domains, list_mailboxes)
 if __name__ == "__main__":
