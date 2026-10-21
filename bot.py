@@ -355,19 +355,16 @@ def wait_for_ready(page, timeout=60):
     return "none"
 
 # ------------------------------------------------------------- form fill
-def human_warmup(page, seconds=3.0):
-    """Jiggle the mouse and scroll a bit so Imperva sees activity."""
+def human_warmup(page, seconds=1.2):
+    """Small mouse jiggle. Kept SHORT so the reese84 token stays fresh."""
     try:
         w = page.viewport_size or {"width": 1366, "height": 900}
         end = time.time() + seconds
         while time.time() < end:
             page.mouse.move(random.randint(60, w["width"] - 60),
                             random.randint(60, w["height"] - 60),
-                            steps=random.randint(6, 18))
-            time.sleep(random.uniform(0.15, 0.45))
-        page.mouse.wheel(0, random.randint(80, 260))
-        time.sleep(random.uniform(0.3, 0.7))
-        page.mouse.wheel(0, -random.randint(40, 120))
+                            steps=random.randint(4, 10))
+            time.sleep(random.uniform(0.08, 0.2))
     except Exception:
         pass
 
@@ -378,21 +375,24 @@ def blocked_page(page):
     except Exception:
         return False
 
-def wait_for_reese(page, timeout=30):
-    """reese84 is the ONLY Imperva cookie that matters for a POST.
-    nlbi_* and visid_incap_* are set on every response and mean nothing."""
+def reese_value(page):
+    for c in page.context.cookies():
+        if (c.get("name") or "").startswith("reese84"):
+            return c.get("value") or ""
+    return ""
+
+def wait_for_reese(page, timeout=15):
     end = time.time() + timeout
     while time.time() < end:
-        names = cookie_names(page)
-        if any(n.startswith("reese84") for n in names):
+        if reese_value(page):
             print("  reese84 present")
             return True
-        time.sleep(1)
-    print("  no reese84 after %ds - cookies: %s" % (timeout, cookie_names(page)))
+        time.sleep(0.5)
+    print("  no reese84 - cookies: %s" % cookie_names(page))
     return False
 
 def fill_label(page, label, value):
-    """Type the value with real keystrokes - Imperva watches keydown/keyup."""
+    """Type with real keystrokes but quickly - Imperva wants keys, not slowness."""
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
     for sel in [f'input[name="{label.lower()}"]',
@@ -404,10 +404,10 @@ def fill_label(page, label, value):
             continue
         try:
             el.click()
-            time.sleep(random.uniform(0.2, 0.5))
+            time.sleep(random.uniform(0.1, 0.25))
             el.fill("")
-            el.press_sequentially(value, delay=random.randint(55, 135))
-            time.sleep(random.uniform(0.3, 0.8))
+            el.press_sequentially(value, delay=random.randint(20, 60))
+            time.sleep(random.uniform(0.1, 0.3))
             return True
         except Exception:
             try:
@@ -471,13 +471,12 @@ def check_label(page, label):
             pass
     return False
 
-def click_text(page, text, pause=(3.5, 5.5)):
+def click_text(page, text, pause=(2.0, 3.2)):
     for sel in [f'button:has-text("{text}")', f'a:has-text("{text}")',
                 f'input[value*="{text}"]']:
         el = find_any(page, sel)
         if not el:
             continue
-        human_warmup(page, 0.8)
         try:
             el.click()
         except Exception:
@@ -529,12 +528,13 @@ def launch(p):
 def one_account(page, acc):
     """Fill and submit the signup, retrying the whole thing if Imperva blocks."""
     for attempt in range(4):
+        t0 = time.time()
         print(f"  --- attempt {attempt + 1} ---")
         try:
             page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
         except Exception as e:
             print("  goto failed:", e)
-        time.sleep(random.uniform(6, 9))
+        time.sleep(random.uniform(3.5, 5.0))
         print("  landed on:", page.url)
 
         for _ in range(3):
@@ -547,45 +547,33 @@ def one_account(page, acc):
                     solve_any(page, wait=4)
                 except CaptchaFail as e:
                     print("  captcha fail:", e)
-                time.sleep(4)
+                time.sleep(3)
                 continue
-            time.sleep(8)
+            time.sleep(6)
 
         if field_count(page) == 0:
             print("  still no form")
             snap(page, f"{acc['username']}_nofields")
             return "failed"
 
-        # the challenge script needs to actually hand us reese84 before we POST
-        if not wait_for_reese(page, 25):
-            print("  reloading to re-run the challenge")
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=60000)
-            except Exception as e:
-                print("  reload failed:", e)
-            time.sleep(6)
-            wait_for_reese(page, 20)
-
-        human_warmup(page, 2.5)
+        wait_for_reese(page, 15)
+        human_warmup(page, 1.0)
 
         set_select(page, "country", COUNTRY)
         set_select(page, "year", str(DOB_YEAR))
         set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
         set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
-        time.sleep(random.uniform(1.5, 2.5))
         click_text(page, "Continue")
-        time.sleep(3)
+        time.sleep(2)
 
         if click_text(page, "Yes, This Is Correct"):
             print("  birthdate confirmed")
-            time.sleep(random.uniform(4, 7))
+            time.sleep(random.uniform(2.5, 4.0))
 
         for _ in range(4):
             if find_any(page, 'input[name="username"]'):
                 break
-            time.sleep(4)
-
-        human_warmup(page, 1.5)
+            time.sleep(2)
 
         filled = {}
         filled["username"] = fill_label(page, "username", acc["username"])
@@ -596,47 +584,42 @@ def one_account(page, acc):
             print("  field fill failed, retrying page")
             continue
 
-        for _ in range(3):
-            try:
-                page.keyboard.press("Tab")
-                time.sleep(0.35)
-            except Exception:
-                pass
-
         print("  terms ticked:", check_label(page, "terms"))
-        time.sleep(1)
 
-        # wait for the invisible reCAPTCHA token to populate before submitting
-        for _ in range(12):
+        for _ in range(6):
             tok = find_any(page, 'input[name="recaptcha-token"]')
             try:
                 if tok and (tok.input_value() or "").strip():
                     break
             except Exception:
                 pass
-            time.sleep(1)
-        time.sleep(random.uniform(2.0, 3.5))
+            time.sleep(0.8)
 
-        print("  cookies before submit:", cookie_names(page))
+        t_submit = time.time() - t0
+        print("  time to submit: %.1fs   reese84 len=%d" % (t_submit, len(reese_value(page))))
 
-        click_text(page, "Continue", pause=(6, 8))
+        click_text(page, "Continue", pause=(3.5, 5.0))
         print("  after submit url:", page.url)
         page_text(page)
         dump_errors(page)
         snap(page, f"{acc['username']}_submitted")
 
         if blocked_page(page):
-            print("  >>> IMPERVA BLOCK - cookies were:", cookie_names(page))
-            link = wait_for_link(acc["email"], acc["mail_token"],
-                                 acc["mail_base"], timeout=35)
-            if link:
-                print("  link:", link[:80])
-                page.goto(link, wait_until="domcontentloaded", timeout=90000)
-                time.sleep(3)
-                print("  activated")
-                return "ok"
-            time.sleep(random.uniform(18, 28))
-            continue
+            print("  >>> IMPERVA BLOCK")
+            time.sleep(4)
+            if not blocked_page(page):
+                print("  block cleared on its own")
+            else:
+                link = wait_for_link(acc["email"], acc["mail_token"],
+                                     acc["mail_base"], timeout=35)
+                if link:
+                    print("  link:", link[:80])
+                    page.goto(link, wait_until="domcontentloaded", timeout=90000)
+                    time.sleep(3)
+                    print("  activated")
+                    return "ok"
+                time.sleep(random.uniform(10, 16))
+                continue
 
         body = page.content().lower()
         if "not valid" in body or "creation failed" in body:
