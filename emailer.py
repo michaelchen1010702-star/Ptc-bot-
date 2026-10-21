@@ -1,18 +1,24 @@
 """
 emailer.py -- free disposable-inbox layer for the PTC bot.
 
-Providers (auto-rotating, first working one wins):
-    mailtm  -> api.mail.tm
-    mailgw  -> api.mail.gw        (same engine, DIFFERENT domains)
-    sec     -> 1secmail           (many domains)
-    gmail   -> dot-trick on your own Gmail (optional, needs secrets)
+Matches the exact interface bot.py calls:
+    list_mailboxes()                        -> [(base, domain), ...]
+    create_inbox(base, domain)              -> (address, token, base)
+    wait_for_link(address, token, base, t)  -> url | None
 
-Standalone probe / smoke test:
-    python emailer.py
+Providers, in try-order (bot rotates on 'bad_email'):
+    maildrop    maildrop.cc      GraphQL API, no signup
+    guerrilla   10 domains       ajax API, no signup
+    mailtm      maxxspace.com    REST API
+    mailgw      mail.gw          REST API (same shape as mail.tm)
+    gmail       gmail.com        dot-trick, needs secrets (optional)
 
-Force a provider or blacklist a bad domain via env:
-    EMAIL_PROVIDER=mailgw
-    DOMAIN_BLOCK=maxxspace.com,1secmail.com
+Env knobs:
+    DOMAIN_BLOCK=maxxspace.com,sharklasers.com    skip these
+    EMAIL_PROVIDER=guerrilla                      only this provider
+    DOMAIN_ORDER=gmail.com,maildrop.cc            try these first
+
+Probe:  python emailer.py
 """
 
 import json
@@ -26,261 +32,47 @@ import urllib.request
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-MAILTM = "https://api.mail.tm"
-MAILGW = "https://api.mail.gw"
-SECBASES = ["https://www.1secmail.com/api/v1/",
-            "https://api.1secmail.com/api/v1/"]
+TM = {"mailtm": "https://api.mail.tm", "mailgw": "https://api.mail.gw"}
+GM = "https://api.guerrillamail.com/ajax.php"
+MD = "https://api.maildrop.cc/graphql"
+
+# Guerrilla aliases every one of these to the same mailbox.
+GM_DOMAINS = ["guerrillamailblock.com", "sharklasers.com", "grr.la",
+              "guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
+              "guerrillamail.biz", "guerrillamail.de", "spam4.me",
+              "pokemail.net"]
 
 
-def _req(url, method="GET", body=None, headers=None, timeout=30):
-    h = {"Accept": "application/json", "User-Agent": UA}
+# ------------------------------------------------------------------ plumbing
+
+def _get(url, headers=None, timeout=30):
+    h = {"User-Agent": UA, "Accept": "application/json"}
     if headers:
         h.update(headers)
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode()
-        h["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read().decode("utf-8", "replace")
+        return r.read().decode("utf-8", "replace")
+
+
+def _post(url, obj, timeout=30):
+    h = {"User-Agent": UA, "Accept": "application/json",
+         "Content-Type": "application/json"}
+    req = urllib.request.Request(url, data=json.dumps(obj).encode(),
+                                 headers=h, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _j(txt):
     try:
-        return json.loads(raw)
+        return json.loads(txt)
     except Exception:
-        return {"_raw": raw}
+        return None
 
 
 def _rand(n=10):
     return "".join(random.choice(string.ascii_lowercase + string.digits)
                    for _ in range(n))
-
-
-def _norm(subject, text, html):
-    if isinstance(text, list):
-        text = "\n".join(str(x) for x in text)
-    if isinstance(html, list):
-        html = "\n".join(str(x) for x in html)
-    return {"subject": subject or "", "text": text or "", "html": html or ""}
-
-
-def _blocked():
-    return {d.strip().lower() for d in os.getenv("DOMAIN_BLOCK", "").split(",")
-            if d.strip()}
-
-
-# ---------------------------------------------------------------- providers
-
-class _Tm:
-    """mail.tm / mail.gw -- identical REST API, separate domain pools."""
-
-    def __init__(self, name, base):
-        self.name = name
-        self.base = base
-
-    def domains(self):
-        j = _req(self.base + "/domains")
-        return [d["domain"] for d in j.get("hydra:member", [])
-                if d.get("isActive", True)]
-
-    def make(self, domain):
-        return "ptc%s@%s" % (_rand(8), domain)
-
-    def create(self, address, password):
-        _req(self.base + "/accounts", "POST",
-             {"address": address, "password": password})
-        tok = _req(self.base + "/token", "POST",
-                   {"address": address, "password": password}).get("token")
-        if not tok:
-            raise RuntimeError("no token returned")
-        return {"provider": self.name, "address": address,
-                "password": password, "token": tok, "base": self.base}
-
-    def messages(self, ib):
-        auth = {"Authorization": "Bearer " + ib["token"]}
-        lst = _req(self.base + "/messages", headers=auth).get("hydra:member", [])
-        out = []
-        for m in lst:
-            d = _req(self.base + "/messages/" + m["id"], headers=auth)
-            out.append(_norm(d.get("subject", ""), d.get("text", ""),
-                             d.get("html", "")))
-        return out
-
-
-class _Sec:
-    """1secmail -- no account step, many domains, shared read access."""
-
-    name = "sec"
-
-    def _base(self):
-        for b in SECBASES:
-            try:
-                _req(b + "?action=getDomainList")
-                return b
-            except Exception:
-                continue
-        raise RuntimeError("1secmail unreachable")
-
-    def domains(self):
-        j = _req(self._base() + "?action=getDomainList")
-        return j if isinstance(j, list) else []
-
-    def make(self, domain):
-        return "%s@%s" % (_rand(10), domain)
-
-    def create(self, address, password=None):
-        login, _, domain = address.partition("@")
-        return {"provider": self.name, "address": address,
-                "login": login, "domain": domain}
-
-    def messages(self, ib):
-        b = self._base()
-        lst = _req("%s?action=getMessages&login=%s&domain=%s"
-                   % (b, ib["login"], ib["domain"]))
-        if not isinstance(lst, list):
-            return []
-        out = []
-        for m in lst:
-            try:
-                d = _req("%s?action=readMessage&login=%s&domain=%s&id=%s"
-                         % (b, ib["login"], ib["domain"], m["id"]))
-            except Exception:
-                continue
-            out.append(_norm(d.get("subject", ""),
-                             d.get("textBody", "") or d.get("body", ""),
-                             d.get("htmlBody", "")))
-        return out
-
-
-class _Gmail:
-    """Your own Gmail + the dot trick. Gmail ignores dots, Pokemon does not."""
-
-    name = "gmail"
-
-    def _cred(self):
-        u = os.getenv("GMAIL_USER", "").strip()
-        p = os.getenv("GMAIL_APP_PASSWORD", "").strip()
-        return (u, p) if u and p and "@" in u else (None, None)
-
-    def domains(self):
-        u, p = self._cred()
-        return [u.split("@", 1)[1]] if u else []
-
-    def make(self, domain):
-        u, _ = self._cred()
-        local = u.split("@", 1)[0]
-        out = [local[0]]
-        for ch in local[1:]:
-            out.append(("." if random.random() < 0.5 else "") + ch)
-        return "".join(out) + "@" + domain
-
-    def create(self, address, password=None):
-        u, p = self._cred()
-        return {"provider": self.name, "address": address, "user": u, "pw": p}
-
-    def messages(self, ib):
-        import email as _email
-        import imaplib
-        from email.header import decode_header
-
-        out = []
-        M = imaplib.IMAP4_SSL("imap.gmail.com")
-        try:
-            M.login(ib["user"], ib["pw"])
-            M.select("INBOX")
-            _, data = M.search(None, "UNSEEN")
-            for num in data[0].split():
-                _, raw = M.fetch(num, "(RFC822)")
-                msg = _email.message_from_bytes(raw[0][1])
-                subj = ""
-                for chunk, enc in decode_header(msg.get("Subject", "")):
-                    subj += chunk.decode(enc or "utf-8", "replace") \
-                        if isinstance(chunk, bytes) else chunk
-                text, html = "", ""
-                for part in msg.walk():
-                    ct = part.get_content_type()
-                    if ct == "text/plain" and not text:
-                        text = _payload(part)
-                    elif ct == "text/html" and not html:
-                        html = _payload(part)
-                out.append(_norm(subj, text, html))
-                M.store(num, "+FLAGS", "\\Seen")
-        finally:
-            try:
-                M.logout()
-            except Exception:
-                pass
-        return out
-
-
-def _payload(part):
-    try:
-        raw = part.get_payload(decode=True) or b""
-        return raw.decode(part.get_content_charset() or "utf-8", "replace")
-    except Exception:
-        return ""
-
-
-_PROVIDERS = [_Tm("mailtm", MAILTM), _Tm("mailgw", MAILGW), _Sec(), _Gmail()]
-_ALIAS = {"mail.tm": "mailtm", "mail.gw": "mailgw", "1secmail": "sec",
-          "gmail.com": "gmail"}
-
-
-# ------------------------------------------------------------------- public
-
-def domain_probe():
-    out = {}
-    for p in _PROVIDERS:
-        try:
-            out[p.name] = p.domains()
-        except Exception as e:
-            out[p.name] = ["ERROR: %s" % e]
-    return out
-
-
-list_domains = domain_probe
-list_mailboxes = domain_probe
-
-
-def create_inbox(provider=None, domain=None, prefix="ptc"):
-    want = (provider or os.getenv("EMAIL_PROVIDER", "")).strip().lower()
-    want = _ALIAS.get(want, want)
-    bad = _blocked()
-    errors = []
-
-    for p in _PROVIDERS:
-        if want and p.name != want:
-            continue
-        try:
-            doms = p.domains()
-        except Exception as e:
-            errors.append("%s: %s" % (p.name, e))
-            continue
-        doms = [d for d in doms if d.lower() not in bad]
-        if domain:
-            doms = [d for d in doms if d == domain]
-        if not doms:
-            errors.append("%s: no usable domain" % p.name)
-            continue
-        random.shuffle(doms)
-        for d in doms:
-            addr = p.make(d)
-            try:
-                ib = p.create(addr, _rand(12) + "Aa1!")
-                print("[mail] %s -> %s" % (p.name, addr))
-                return ib
-            except Exception as e:
-                errors.append("%s/%s: %s" % (p.name, d, e))
-    raise RuntimeError("no inbox available: " + " | ".join(errors))
-
-
-def fetch_messages(inbox):
-    for p in _PROVIDERS:
-        if p.name == inbox.get("provider"):
-            try:
-                return p.messages(inbox)
-            except Exception as e:
-                print("[mail] fetch error: %s" % e)
-                return []
-    return []
 
 
 def _links(blob):
@@ -293,43 +85,274 @@ def _links(blob):
     return out
 
 
-def wait_for_link(inbox, timeout=300, interval=8, want=("pokemon", "verify",
-                                                        "activ", "confirm")):
-    """Return the activation URL (or a 6-digit code if that's what arrives)."""
-    deadline = time.time() + timeout
+def _blocked():
+    return {d.strip().lower() for d in os.getenv("DOMAIN_BLOCK", "").split(",")
+            if d.strip()}
+
+
+# ----------------------------------------------------------------- maildrop
+
+def _md_links(mailbox):
+    q = 'query { inbox(mailbox: "%s") { id subject data html } }' % mailbox
+    j = _j(_post(MD, {"query": q})) or {}
+    out = []
+    for m in (j.get("data", {}) or {}).get("inbox") or []:
+        out += _links((m.get("data") or "") + "\n" + (m.get("html") or ""))
+    return out
+
+
+# ---------------------------------------------------------------- guerrilla
+
+def _gm_create(domain):
+    u = "ptc" + _rand(8)
+    j0 = _j(_get("%s?f=get_email_address&site=%s" % (GM, domain))) or {}
+    sid = j0.get("sid_token") or ""
+    if not sid:
+        raise RuntimeError("guerrilla: no session")
+    _get("%s?f=set_email_user&email_user=%s&sid_token=%s&site=%s"
+         % (GM, u, sid, domain))
+    return "%s@%s" % (u, domain), sid
+
+
+def _gm_links(sid):
+    j = _j(_get("%s?f=check_email&seq=0&sid_token=%s" % (GM, sid))) or {}
+    out = []
+    for m in j.get("list") or []:
+        body = m.get("mail_body") or ""
+        if not body and m.get("mail_id"):
+            d = _j(_get("%s?f=fetch_email&email_id=%s&sid_token=%s"
+                        % (GM, m["mail_id"], sid))) or {}
+            body = d.get("mail_body") or ""
+        out += _links((m.get("mail_excerpt") or "") + "\n" + body)
+    return out
+
+
+# ------------------------------------------------------------------- mail.tm
+
+def _tm_domains(base):
+    txt = _get(base + "/domains")
+    j = _j(txt)
+    if j is None:                                   # XML fallback
+        return re.findall(r"<domain>([^<]+)</domain>", txt)
+    rows = j if isinstance(j, list) else None
+    if rows is None:
+        for k in ("hydra:member", "items", "domains"):
+            if isinstance(j.get(k), list):
+                rows = j[k]
+                break
+    if not rows:
+        return []
+    out = []
+    for d in rows:
+        if not isinstance(d, dict) or not d.get("domain"):
+            continue
+        if str(d.get("isActive", 1)).lower() in ("0", "false"):
+            continue
+        out.append(d["domain"])
+    return out
+
+
+def _tm_create(base, address, password):
+    _post(base + "/accounts", {"address": address, "password": password})
+    tok = _j(_post(base + "/token",
+                   {"address": address, "password": password})) or {}
+    if not tok.get("token"):
+        raise RuntimeError("mail.tm: no token")
+    return tok["token"]
+
+
+def _tm_links(base, token):
+    auth = {"Authorization": "Bearer " + token}
+    j = _j(_get(base + "/messages", auth))
+    msgs = j if isinstance(j, list) else (j or {}).get("hydra:member", [])
+    out = []
+    for m in msgs or []:
+        d = _j(_get(base + "/messages/" + m["id"], auth)) or {}
+        html = d.get("html") or []
+        body = "\n".join(html) if isinstance(html, list) else str(html)
+        out += _links(body + "\n" + (d.get("text") or ""))
+    return out
+
+
+# --------------------------------------------------------------------- gmail
+
+def _gmail_addr(domain):
+    u = os.getenv("GMAIL_USER", "").strip()
+    local = u.split("@", 1)[0]
+    if len(local) < 2:
+        return "%s+ptc%s@%s" % (local, _rand(6), domain)
+    parts = [local[0]]
+    for ch in local[1:]:
+        parts.append(("." if random.random() < 0.5 else "") + ch)
+    return "".join(parts) + "@" + domain
+
+
+def _gmail_links(address):
+    import email as _email
+    import imaplib
+    from email.header import decode_header
+
+    out = []
+    M = imaplib.IMAP4_SSL("imap.gmail.com")
+    try:
+        M.login(os.getenv("GMAIL_USER", "").strip(),
+                os.getenv("GMAIL_APP_PASSWORD", "").strip())
+        M.select("INBOX")
+        _, data = M.search(None, "TO", address)
+        for num in (data[0] or b"").split():
+            _, raw = M.fetch(num, "(RFC822)")
+            msg = _email.message_from_bytes(raw[0][1])
+            text, html = "", ""
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == "text/plain" and not text:
+                    text = _payload(part)
+                elif ct == "text/html" and not html:
+                    html = _payload(part)
+            out += _links(html + "\n" + text)
+            M.store(num, "+FLAGS", "\\Seen")
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return out
+
+
+def _payload(part):
+    try:
+        raw = part.get_payload(decode=True) or b""
+        return raw.decode(part.get_content_charset() or "utf-8", "replace")
+    except Exception:
+        return ""
+
+
+# ------------------------------------------------------------------ dispatch
+
+def _domains(tag):
+    if tag in TM:
+        return _tm_domains(TM[tag])
+    if tag == "guerrilla":
+        return list(GM_DOMAINS)
+    if tag == "maildrop":
+        return ["maildrop.cc"]
+    if tag == "gmail":
+        u = os.getenv("GMAIL_USER", "").strip()
+        if "@" in u and os.getenv("GMAIL_APP_PASSWORD"):
+            return [u.split("@", 1)[1]]
+        return []
+    raise RuntimeError("unknown provider " + tag)
+
+
+def list_mailboxes():
+    want = os.getenv("EMAIL_PROVIDER", "").strip().lower()
+    bad = _blocked()
+    out = []
+    for tag in ("maildrop", "guerrilla", "mailtm", "mailgw", "gmail"):
+        if want and tag != want:
+            continue
+        try:
+            doms = _domains(tag)
+        except Exception as e:
+            print("  %s unavailable: %s" % (tag, e))
+            continue
+        for d in doms:
+            if d.lower() not in bad:
+                out.append((tag, d))
+    pref = [x.strip().lower() for x in os.getenv("DOMAIN_ORDER", "").split(",")
+            if x.strip()]
+    if pref:
+        out.sort(key=lambda t: pref.index(t[1].lower())
+                 if t[1].lower() in pref else 99)
+    return out
+
+
+def create_inbox(base, domain):
+    if base == "maildrop":
+        return "%s@%s" % (_rand(12), domain), "", base
+    if base == "guerrilla":
+        addr, sid = _gm_create(domain)
+        return addr, sid, base
+    if base in TM:
+        addr = "ptc%s@%s" % (_rand(8), domain)
+        return addr, _tm_create(TM[base], addr, _rand(12) + "Aa1!"), base
+    if base == "gmail":
+        return _gmail_addr(domain), "", base
+    raise RuntimeError("unknown base " + base)
+
+
+def _poll(base, address, token):
+    if base == "maildrop":
+        return _md_links(address.split("@")[0])
+    if base == "guerrilla":
+        return _gm_links(token)
+    if base in TM:
+        return _tm_links(TM[base], token)
+    if base == "gmail":
+        return _gmail_links(address)
+    return []
+
+
+SKIP = ("facebook", "twitter", "instagram", "youtube", "unsubscribe",
+        "privacy", "terms", "help.guerrillamail")
+
+
+def wait_for_link(address, token, base, timeout=180):
+    end = time.time() + timeout
     seen = set()
-    while time.time() < deadline:
-        for m in fetch_messages(inbox):
-            key = (m["subject"], m["text"][:60], m["html"][:60])
-            if key in seen:
+    fallback = None
+    while time.time() < end:
+        try:
+            links = _poll(base, address, token)
+        except Exception as e:
+            print("    poll error:", e)
+            links = []
+        for l in links:
+            if l in seen:
                 continue
-            seen.add(key)
-            blob = m["html"] + "\n" + m["text"]
-            links = _links(blob)
-            good = [l for l in links if any(w in l.lower() for w in want)]
-            if good or links:
-                print("[mail] subject: %s" % m["subject"][:70])
-                return (good or links)[0]
-            code = re.search(r"\b(\d{6})\b", blob)
-            if code:
-                print("[mail] code: %s" % code.group(1))
-                return code.group(1)
-        time.sleep(interval)
-    print("[mail] timed out waiting for activation")
-    return None
+            seen.add(l)
+            if "pokemon" in l.lower():
+                print("    activation link:", l[:95])
+                return l
+            if not fallback and not any(s in l.lower() for s in SKIP):
+                fallback = l
+        if fallback and time.time() > end - timeout + 60:
+            print("    link (fallback):", fallback[:95])
+            return fallback
+        time.sleep(6)
+    if fallback:
+        print("    link (late fallback):", fallback[:95])
+    return fallback
 
 
+# --------------------------------------------------------------------- probe
+
+def domain_probe():
+    out = {}
+    for tag in ("maildrop", "guerrilla", "mailtm", "mailgw", "gmail"):
+        try:
+            out[tag] = _domains(tag)
+        except Exception as e:
+            out[tag] = ["ERROR: %s" % e]
+    return out
+
+
+list_domains = domain_probe
 wait_for_code = wait_for_link
 wait_gmail = wait_for_link
 wait_code = wait_for_link
 
 
 if __name__ == "__main__":
-    print("--- live domains per provider ---")
+    print("--- reachable domains ---")
+    total = 0
     for name, doms in domain_probe().items():
-        print("%s: %d" % (name, len(doms)))
-        for d in doms:
-            print("    ", d)
-    print("--- creating a test inbox ---")
-    box = create_inbox()
-    print("address:", box["address"])
+        print("%-10s %s" % (name, doms if doms else "(not configured)"))
+        total += len(doms)
+    print("total candidate domains:", total)
+    try:
+        base, domain = list_mailboxes()[0]
+        addr, tok, base = create_inbox(base, domain)
+        print("test inbox: %s  [provider=%s]" % (addr, base))
+    except Exception as e:
+        print("test inbox FAILED:", e)
