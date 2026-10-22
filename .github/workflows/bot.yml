@@ -7,20 +7,12 @@ on:
         description: 'how many accounts'
         default: '1'
 
-concurrency:
-  group: ptc-bot
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
 jobs:
   run:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     timeout-minutes: 60
     env:
       SHEETS_URL: ${{ secrets.SHEETS_URL }}
@@ -41,39 +33,27 @@ jobs:
           wc -l bot.py
           python3 -m py_compile bot.py && echo COMPILE_OK || echo COMPILE_FAILED
 
-      - name: system deps (linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg xvfb
+      - name: system deps
+        run: command -v ffmpeg >/dev/null || brew install ffmpeg || true
 
       - name: python deps
         run: pip install -r requirements.txt
 
       - name: playwright browsers
-        if: runner.os == 'Linux'
-        run: python -m playwright install --with-deps chromium chrome
-
-      - name: playwright browsers (macos)
-        if: runner.os == 'macOS'
         run: python -m playwright install chromium chrome
 
       - name: email probe
         continue-on-error: true
         run: python emailer.py
 
-      - name: run bot (linux)
-        if: runner.os == 'Linux'
-        timeout-minutes: 45
-        run: xvfb-run -a python bot.py
-
-      - name: run bot (macos)
-        if: runner.os == 'macOS'
+      - name: run bot
         timeout-minutes: 45
         run: python bot.py
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: logs-${{ matrix.os }}
+          name: logs
           path: |
             accounts.csv
             debug/
