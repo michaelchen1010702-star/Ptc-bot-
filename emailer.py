@@ -6,19 +6,14 @@ Interface, matching exactly what bot.py calls:
     create_inbox(base, domain)              -> (address, token, base)
     wait_for_link(address, token, base, t)  -> url | None
 
-bot.py rotates to the next (base, domain) every time Pokemon answers
-'email not valid', so the length of this list is how many shots you get
-at beating the blocklist.
-
-Providers: maildrop, guerrilla (10 domains), yopmail (13 domains),
-tempmail.lol, mail.tm, mail.gw, gmail (optional, last).
+Provider order matters: bot.py walks it top-down and skips any domain that
+Pokemon rejects, so the confirmed-good provider is first.
 
 Env knobs:
-    DOMAIN_ORDER=grr.la,maildrop.cc    try these first
-    DOMAIN_BLOCK=sharklasers.com       never use these
-    EMAIL_PROVIDER=yopmail             only this provider
-
-Probe:  python emailer.py
+    TMP_DOMAIN=some.domain     pin a tempmail.lol domain instead of random
+    DOMAIN_ORDER=auto          force a specific domain to the front
+    DOMAIN_BLOCK=a.com,b.com   never use these
+    EMAIL_PROVIDER=tempmail    only this provider
 """
 
 import http.cookiejar
@@ -26,9 +21,26 @@ import json
 import os
 import random
 import re
+import socket
 import string
 import time
+import urllib.parse
 import urllib.request
+
+# --------------------------------------------------------------- IPv4 first
+# GitHub runners have no IPv6 route. api.mail.gw publishes an AAAA record, so
+# urllib picks IPv6 and dies with 'Network is unreachable'.
+_gai = socket.getaddrinfo
+
+
+def _gai4(host, port, family=0, type=0, proto=0, flags=0):
+    try:
+        return _gai(host, port, socket.AF_INET, type, proto, flags)
+    except Exception:
+        return _gai(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _gai4
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -99,6 +111,47 @@ def _blocked():
             if d.strip()}
 
 
+def _retry(fn, tries=4, label="", pause=3):
+    last = None
+    for i in range(tries):
+        try:
+            out = fn()
+            if out:
+                return out
+        except Exception as e:
+            last = e
+            print("  %s retry %d: %s" % (label, i + 1, e))
+        time.sleep(pause)
+    if last:
+        raise last
+    return None
+
+
+# --------------------------------------------------------------- tempmail.lol
+
+def _tmp_create(domain=None):
+    body = {}
+    if domain and domain != "auto":
+        body["domain"] = domain
+    j = _j(_post(TMP + "/inbox/create", body)) or {}
+    if not j.get("address"):
+        raise RuntimeError("tempmail: %s" % j)
+    print("    tempmail gave: %s" % j["address"])
+    return j["address"], j["token"]
+
+
+def _tmp_links(token):
+    # the token is base64 and can contain + / = -- unescaped '+' means space
+    url = "%s/inbox?token=%s" % (TMP, urllib.parse.quote(token, safe=""))
+    j = _j(_open(url)) or {}
+    out = []
+    for m in j.get("emails") or []:
+        out += _links((m.get("body") or "") + "\n" + (m.get("html") or ""))
+    if not out and j:
+        out += _links(json.dumps(j))
+    return out
+
+
 # ----------------------------------------------------------------- maildrop
 
 def _md_links(mailbox):
@@ -159,23 +212,6 @@ def _yop_links(login):
             out += _links(_open("https://yopmail.com/en/rss.php?login=" + login))
         except Exception:
             pass
-    return out
-
-
-# --------------------------------------------------------------- tempmail.lol
-
-def _tmp_create():
-    j = _j(_post(TMP + "/inbox/create", {})) or {}
-    if not j.get("address"):
-        raise RuntimeError("tempmail: %s" % j)
-    return j["address"], j["token"]
-
-
-def _tmp_links(token):
-    j = _j(_open("%s/inbox?token=%s" % (TMP, token))) or {}
-    out = []
-    for m in j.get("emails") or []:
-        out += _links((m.get("body") or "") + "\n" + (m.get("html") or ""))
     return out
 
 
@@ -277,15 +313,15 @@ def _payload(part):
 
 def _domains(tag):
     if tag in TM:
-        return _tm_domains(TM[tag])
+        return _retry(lambda: _tm_domains(TM[tag]), tries=4, label=tag)
+    if tag == "tempmail":
+        return [os.getenv("TMP_DOMAIN", "").strip() or "auto"]
     if tag == "guerrilla":
         return list(GM_DOMAINS)
     if tag == "yopmail":
         return list(YOP_DOMAINS)
     if tag == "maildrop":
         return ["maildrop.cc"]
-    if tag == "tempmail":
-        return ["auto"]
     if tag == "gmail":
         u = os.getenv("GMAIL_USER", "").strip()
         if "@" in u and os.getenv("GMAIL_APP_PASSWORD"):
@@ -294,12 +330,15 @@ def _domains(tag):
     raise RuntimeError("unknown provider " + tag)
 
 
+ORDER = ("tempmail", "mailgw", "maildrop", "guerrilla", "yopmail",
+         "mailtm", "gmail")
+
+
 def list_mailboxes():
     want = os.getenv("EMAIL_PROVIDER", "").strip().lower()
     bad = _blocked()
     out = []
-    for tag in ("maildrop", "guerrilla", "yopmail", "tempmail", "mailtm",
-                "mailgw", "gmail"):
+    for tag in ORDER:
         if want and tag != want:
             continue
         try:
@@ -318,39 +357,55 @@ def list_mailboxes():
     return out
 
 
-def create_inbox(base, domain):
-    if base == "maildrop":
-        return "%s@%s" % (_rand(12), domain), "", base
-    if base == "guerrilla":
-        addr, sid = _gm_create(domain)
-        return addr, sid, base
-    if base == "yopmail":
-        return "ptc%s@%s" % (_rand(9), domain), _rand(9), base
+def _create(base, domain):
     if base == "tempmail":
-        addr, tok = _tmp_create()
-        return addr, tok, base
+        return _tmp_create(domain)
+    if base == "maildrop":
+        return "%s@%s" % (_rand(12), domain), ""
+    if base == "guerrilla":
+        return _gm_create(domain)
+    if base == "yopmail":
+        return "ptc%s@%s" % (_rand(9), domain), _rand(9)
     if base in TM:
         addr = "ptc%s@%s" % (_rand(8), domain)
-        return addr, _tm_create(TM[base], addr, _rand(12) + "Aa1!"), base
+        return addr, _tm_create(TM[base], addr, _rand(12) + "Aa1!")
     if base == "gmail":
-        return _gmail_addr(domain), "", base
+        return _gmail_addr(domain), ""
     raise RuntimeError("unknown base " + base)
 
 
+def create_inbox(base, domain):
+    pair = _retry(lambda: _create(base, domain), tries=3,
+                  label="create %s/%s" % (base, domain), pause=2)
+    if not pair:
+        raise RuntimeError("no inbox from %s" % base)
+    addr, token = pair
+    return addr, token, base
+
+
 def _poll(base, address, token):
+    if base == "tempmail":
+        return _tmp_links(token)
     if base == "maildrop":
         return _md_links(address.split("@")[0])
     if base == "guerrilla":
         return _gm_links(token)
     if base == "yopmail":
         return _yop_links(address.split("@")[0])
-    if base == "tempmail":
-        return _tmp_links(token)
     if base in TM:
         return _tm_links(TM[base], token)
     if base == "gmail":
         return _gmail_links(address)
     return []
+
+
+def fetch_messages(inbox, token=None, base=None):
+    """bot.py imports this; accepts an inbox dict or (address, token, base)."""
+    if isinstance(inbox, dict):
+        base = inbox.get("provider") or inbox.get("base") or ""
+        token = inbox.get("token")
+        inbox = inbox.get("address") or ""
+    return _poll(base, inbox, token)
 
 
 SKIP = ("facebook", "twitter", "instagram", "youtube", "unsubscribe",
@@ -388,8 +443,7 @@ def wait_for_link(address, token, base, timeout=180):
 
 def domain_probe():
     out = {}
-    for tag in ("maildrop", "guerrilla", "yopmail", "tempmail", "mailtm",
-                "mailgw", "gmail"):
+    for tag in ORDER:
         try:
             out[tag] = _domains(tag)
         except Exception as e:
@@ -416,26 +470,3 @@ if __name__ == "__main__":
         print("test inbox: %s  [provider=%s]" % (addr, base))
     except Exception as e:
         print("test inbox FAILED:", e)
-# ---- appended: bot.py also imports fetch_messages ----
-def fetch_messages(inbox, token=None, base=None):
-    if isinstance(inbox, dict):
-        base = inbox.get("provider") or inbox.get("base") or ""
-        token = inbox.get("token")
-        inbox = inbox.get("address") or ""
-    return _poll(base, inbox, token)
-
-
-# ---- appended: try the fresh mail.gw domain first, then sweep the rest ----
-_DEFAULT_ORDER = "westcast-systems.com"
-_orig_list_mailboxes = list_mailboxes
-
-
-def list_mailboxes():
-    boxes = _orig_list_mailboxes()
-    pref = [d.strip().lower()
-            for d in os.getenv("DOMAIN_ORDER", _DEFAULT_ORDER).split(",")
-            if d.strip()]
-    if pref:
-        boxes.sort(key=lambda t: pref.index(t[1].lower())
-                   if t[1].lower() in pref else 99)
-    return boxes
