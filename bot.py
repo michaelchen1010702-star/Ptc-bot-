@@ -5,6 +5,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ----------------------------------------------------------------- config
 SIGNUP_URL = "https://join.pokemon.com/"
+WARMUP_URL = "https://www.pokemon.com/us/"
 COUNTRY    = "United States"
 DOB_YEAR, DOB_MONTH, DOB_DAY = 1990, 1, 1
 MONTH_NAME = "January"
@@ -506,12 +507,15 @@ def launch(p):
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
         "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--window-size=1366,900",
         "--lang=en-US",
     ]
     common = dict(headless=False, args=args,
                   viewport={"width": 1366, "height": 900},
-                  locale="en-US",
-                  timezone_id="America/New_York")
+                  locale="en-US")
     for kw in ({"channel": "chrome", "ignore_default_args": ["--enable-automation"]},
                {"channel": "chrome"},
                {}):
@@ -527,9 +531,19 @@ def launch(p):
 
 def one_account(page, acc):
     """Fill and submit the signup, retrying the whole thing if Imperva blocks."""
-    for attempt in range(4):
+    for attempt in range(6):
         t0 = time.time()
         print(f"  --- attempt {attempt + 1} ---")
+
+        # give Imperva a warm-up hit on the main domain first
+        if attempt == 0:
+            try:
+                page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(random.uniform(2, 4))
+                print("  warmed up on", WARMUP_URL)
+            except Exception as e:
+                print("  warmup failed:", e)
+
         try:
             page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
         except Exception as e:
@@ -621,7 +635,13 @@ def one_account(page, acc):
                     time.sleep(3)
                     print("  activated")
                     return "ok"
-                time.sleep(random.uniform(10, 16))
+                # fresh Imperva session for the next try
+                try:
+                    page.context.clear_cookies()
+                    print("  cookies cleared")
+                except Exception:
+                    pass
+                time.sleep(random.uniform(25, 40))
                 continue
 
         body = page.content().lower()
