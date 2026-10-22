@@ -390,39 +390,48 @@ def wait_for_reese(page, timeout=15):
     print("  no reese84 - cookies: %s" % cookie_names(page))
     return False
 
+def type_text(page, el, text, lo=20, hi=60):
+    """ElementHandle has no press_sequentially - focus it and use the keyboard."""
+    try:
+        el.click()
+    except Exception:
+        pass
+    time.sleep(random.uniform(0.1, 0.25))
+    try:
+        el.fill("")
+    except Exception:
+        pass
+    try:
+        page.keyboard.type(text, delay=random.randint(lo, hi))
+    except Exception:
+        el.fill(text)
+    time.sleep(random.uniform(0.1, 0.3))
+
 def fill_label(page, label, value):
-    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
-    for sel in [f'input[name="{label.lower()}"]',
-                f'input[id*="{label.lower()}"]',
-                f'xpath=//label[{xp}]/following::input[1]',
-                f'input[placeholder*="{label}" i]']:
+    xp = ('contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
+          '"abcdefghijklmnopqrstuvwxyz"),"%s")' % label.lower())
+    for sel in ['input[name="%s"]' % label.lower(),
+                'input[id*="%s"]' % label.lower(),
+                'xpath=//label[%s]/following::input[1]' % xp,
+                'input[placeholder*="%s" i]' % label]:
         el = find_any(page, sel)
         if not el:
             continue
         try:
-            el.click()
-            time.sleep(random.uniform(0.1, 0.25))
-            el.fill("")
-            el.press_sequentially(value, delay=random.randint(20, 60))
-            time.sleep(random.uniform(0.1, 0.3))
+            type_text(page, el, value)
             return True
         except Exception:
-            try:
-                el.fill(value)
-                return True
-            except Exception:
-                continue
+            continue
     return False
 
 def set_select(page, label, value, index_fallback=None):
-    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
-    sels = [f'xpath=//label[{xp}]/following::select[1]',
-            f'xpath=//*[self::label or self::span or self::div][{xp}]/following::select[1]',
-            f'select[name*="{label.lower()}" i]',
-            f'select[id*="{label.lower()}" i]',
-            f'select[aria-label*="{label}" i]']
+    xp = ('contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
+          '"abcdefghijklmnopqrstuvwxyz"),"%s")' % label.lower())
+    sels = ['xpath=//label[%s]/following::select[1]' % xp,
+            'xpath=//*[self::label or self::span or self::div][%s]/following::select[1]' % xp,
+            'select[name*="%s" i]' % label.lower(),
+            'select[id*="%s" i]' % label.lower(),
+            'select[aria-label*="%s" i]' % label]
     for sel in sels:
         el = find_any(page, sel)
         if not el:
@@ -456,8 +465,8 @@ def check_label(page, label):
                 return True
             except Exception:
                 pass
-    xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
+    xp = ('contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
+          '"abcdefghijklmnopqrstuvwxyz"),"%s")' % label.lower())
     el = find_any(page, f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
     if el:
         try:
@@ -511,11 +520,7 @@ def enter_code(page, code):
         print("  no code input found")
         return False
     try:
-        el.click()
-        time.sleep(0.2)
-        el.fill("")
-        el.press_sequentially(code, delay=random.randint(40, 90))
-        time.sleep(0.3)
+        type_text(page, el, code, lo=40, hi=90)
     except Exception as e:
         print("  code fill failed:", e)
         return False
