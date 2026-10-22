@@ -557,18 +557,21 @@ def one_account(page, acc):
             return "failed"
 
         wait_for_reese(page, 15)
-        human_warmup(page, 1.0)
 
-        set_select(page, "country", COUNTRY)
-        set_select(page, "year", str(DOB_YEAR))
-        set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
-        set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
-        click_text(page, "Continue")
-        time.sleep(2)
-
-        if click_text(page, "Yes, This Is Correct"):
-            print("  birthdate confirmed")
-            time.sleep(random.uniform(2.5, 4.0))
+        # Pokemon remembers the age gate via cookies - do not re-run it
+        if find_any(page, 'input[name="username"]'):
+            print("  already on account step")
+        else:
+            human_warmup(page, 1.0)
+            set_select(page, "country", COUNTRY)
+            set_select(page, "year", str(DOB_YEAR))
+            set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
+            set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
+            click_text(page, "Continue")
+            time.sleep(2)
+            if click_text(page, "Yes, This Is Correct"):
+                print("  birthdate confirmed")
+                time.sleep(random.uniform(2.5, 4.0))
 
         for _ in range(4):
             if find_any(page, 'input[name="username"]'):
