@@ -7,6 +7,10 @@ on:
         description: 'how many accounts'
         default: '1'
 
+concurrency:
+  group: ptc-bot
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -33,9 +37,6 @@ jobs:
           wc -l bot.py
           python3 -m py_compile bot.py && echo COMPILE_OK || echo COMPILE_FAILED
 
-      - name: system deps
-        run: command -v ffmpeg >/dev/null || brew install ffmpeg || true
-
       - name: python deps
         run: pip install -r requirements.txt
 
@@ -53,7 +54,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: logs
+          name: logs-macos
           path: |
             accounts.csv
             debug/
