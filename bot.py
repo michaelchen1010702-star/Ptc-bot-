@@ -357,7 +357,6 @@ def wait_for_ready(page, timeout=60):
 
 # ------------------------------------------------------------- form fill
 def human_warmup(page, seconds=1.2):
-    """Small mouse jiggle. Kept SHORT so the reese84 token stays fresh."""
     try:
         w = page.viewport_size or {"width": 1366, "height": 900}
         end = time.time() + seconds
@@ -370,7 +369,6 @@ def human_warmup(page, seconds=1.2):
         pass
 
 def blocked_page(page):
-    """True when Imperva served its 'unusual browsing activity' page."""
     try:
         return "apologize for the interruption" in page.inner_text("body").lower()
     except Exception:
@@ -393,7 +391,6 @@ def wait_for_reese(page, timeout=15):
     return False
 
 def fill_label(page, label, value):
-    """Type with real keystrokes but quickly - Imperva wants keys, not slowness."""
     xp = (f'contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
           f'"abcdefghijklmnopqrstuvwxyz"),"{label.lower()}")')
     for sel in [f'input[name="{label.lower()}"]',
@@ -487,6 +484,54 @@ def click_text(page, text, pause=(2.0, 3.2)):
         return True
     return False
 
+def code_input(page):
+    """Find the activation-code field, whatever Pokemon decided to call it."""
+    for sel in ['input[name*="code" i]', 'input[id*="code" i]',
+                'input[placeholder*="code" i]', 'input[maxlength="6"]',
+                'input[autocomplete="one-time-code"]']:
+        el = find_any(page, sel)
+        if el:
+            return el
+    for fr in all_frames(page):
+        try:
+            for inp in fr.query_selector_all("input"):
+                t = (inp.get_attribute("type") or "text").lower()
+                n = ((inp.get_attribute("name") or "")
+                     + (inp.get_attribute("id") or "")).lower()
+                if t in ("text", "tel", "number", "search") and not any(
+                        k in n for k in ("username", "password", "email")):
+                    return inp
+        except Exception:
+            pass
+    return None
+
+def enter_code(page, code):
+    el = code_input(page)
+    if not el:
+        print("  no code input found")
+        return False
+    try:
+        el.click()
+        time.sleep(0.2)
+        el.fill("")
+        el.press_sequentially(code, delay=random.randint(40, 90))
+        time.sleep(0.3)
+    except Exception as e:
+        print("  code fill failed:", e)
+        return False
+    print("  code entered")
+    for txt in ("Continue", "Activate", "Submit", "Verify", "Next"):
+        if click_text(page, txt, pause=(3, 4)):
+            return True
+    try:
+        el.press("Enter")
+        time.sleep(3)
+        print("  pressed Enter")
+        return True
+    except Exception:
+        pass
+    return False
+
 # ---------------------------------------------------------------- sheets
 def push(row):
     if not SHEETS_URL:
@@ -501,7 +546,6 @@ def push(row):
 
 # ------------------------------------------------------------------ main
 def launch(p):
-    """Real Chrome, persistent profile, automation flag removed."""
     args = [
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
@@ -530,12 +574,10 @@ def launch(p):
     raise RuntimeError("no browser would launch")
 
 def one_account(page, acc):
-    """Fill and submit the signup, retrying the whole thing if Imperva blocks."""
     for attempt in range(6):
         t0 = time.time()
         print(f"  --- attempt {attempt + 1} ---")
 
-        # give Imperva a warm-up hit on the main domain first
         if attempt == 0:
             try:
                 page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=60000)
@@ -572,7 +614,6 @@ def one_account(page, acc):
 
         wait_for_reese(page, 15)
 
-        # Pokemon remembers the age gate via cookies - do not re-run it
         if find_any(page, 'input[name="username"]'):
             print("  already on account step")
         else:
@@ -627,15 +668,6 @@ def one_account(page, acc):
             if not blocked_page(page):
                 print("  block cleared on its own")
             else:
-                link = wait_for_link(acc["email"], acc["mail_token"],
-                                     acc["mail_base"], timeout=35)
-                if link:
-                    print("  link:", link[:80])
-                    page.goto(link, wait_until="domcontentloaded", timeout=90000)
-                    time.sleep(3)
-                    print("  activated")
-                    return "ok"
-                # fresh Imperva session for the next try
                 try:
                     page.context.clear_cookies()
                     print("  cookies cleared")
@@ -652,6 +684,30 @@ def one_account(page, acc):
             print("  >>> username taken")
             return "failed"
 
+        # ---- Pokemon emails a 6-digit activation code
+        if "activation code" in body or "verify your email" in body:
+            print("  >>> ACTIVATION CODE STEP")
+            code = wait_for_code(acc["email"], acc["mail_token"],
+                                 acc["mail_base"], timeout=300)
+            if not code:
+                print("  no code")
+                return "created"
+            if not enter_code(page, code):
+                return "created"
+            time.sleep(4)
+            page_text(page)
+            snap(page, f"{acc['username']}_activated")
+            now = page.content().lower()
+            if "invalid" in now or "incorrect" in now or "expired" in now:
+                print("  >>> CODE REJECTED")
+                return "created"
+            if "activation code" in now:
+                print("  >>> still asking for a code")
+                return "created"
+            print("  activated")
+            return "ok"
+
+        # ---- otherwise fall back to a link in the mail
         print("  waiting for email...")
         link = wait_for_link(acc["email"], acc["mail_token"], acc["mail_base"],
                              timeout=150)
@@ -714,7 +770,7 @@ def main():
                     w.writeheader(); w.writerows(results)
                 print(f"  -> {acc['username']} [{status}]")
 
-                if status == "ok":
+                if status in ("ok", "created"):
                     break
                 if status != "bad_email":
                     break
