@@ -1,19 +1,11 @@
 """
 emailer.py -- disposable-inbox layer for the PTC bot.
 
-Interface, matching exactly what bot.py calls:
+Interface used by bot.py:
     list_mailboxes()                        -> [(base, domain), ...]
     create_inbox(base, domain)              -> (address, token, base)
     wait_for_link(address, token, base, t)  -> url | None
-
-Provider order matters: bot.py walks it top-down and skips any domain that
-Pokemon rejects, so the confirmed-good provider is first.
-
-Env knobs:
-    TMP_DOMAIN=some.domain     pin a tempmail.lol domain instead of random
-    DOMAIN_ORDER=auto          force a specific domain to the front
-    DOMAIN_BLOCK=a.com,b.com   never use these
-    EMAIL_PROVIDER=tempmail    only this provider
+    wait_for_code(address, token, base, t)  -> code | None
 """
 
 import http.cookiejar
@@ -28,8 +20,6 @@ import urllib.parse
 import urllib.request
 
 # --------------------------------------------------------------- IPv4 first
-# GitHub runners have no IPv6 route. api.mail.gw publishes an AAAA record, so
-# urllib picks IPv6 and dies with 'Network is unreachable'.
 _gai = socket.getaddrinfo
 
 
@@ -42,7 +32,7 @@ def _gai4(host, port, family=0, type=0, proto=0, flags=0):
 
 socket.getaddrinfo = _gai4
 
-UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 TM = {"mailtm": "https://api.mail.tm", "mailgw": "https://api.mail.gw"}
@@ -50,17 +40,19 @@ GM = "https://api.guerrillamail.com/ajax.php"
 MD = "https://api.maildrop.cc/graphql"
 TMP = "https://api.tempmail.lol/v2"
 
-# Guerrilla aliases all of these to one mailbox.
 GM_DOMAINS = ["guerrillamailblock.com", "sharklasers.com", "grr.la",
               "guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
               "guerrillamail.biz", "guerrillamail.de", "spam4.me",
               "pokemail.net"]
 
-# YOPmail aliases all of these to one mailbox too.
 YOP_DOMAINS = ["yopmail.com", "yopmail.fr", "yopmail.net", "cool.fr.nf",
                "jetable.fr.nf", "nospam.ze.tc", "nomail.xl.cx", "mega.zik.dj",
                "speed.1s.fr", "courriel.fr.nf", "moncourrier.fr.nf",
                "monemail.fr.nf", "monmail.fr.nf"]
+
+ASSET_EXT = (".eot", ".woff", ".woff2", ".ttf", ".otf", ".css", ".js",
+             ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+             ".mp4", ".pdf", ".zip")
 
 
 # ------------------------------------------------------------------ plumbing
@@ -96,11 +88,24 @@ def _rand(n=10):
                    for _ in range(n))
 
 
-def _links(blob):
+def _strip_html(s):
+    s = re.sub(r"(?is)<(script|style).*?</\1>", " ", s or "")
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = s.replace("&nbsp;", " ").replace("&amp;", "&")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _is_asset(u):
+    return urllib.parse.urlparse(u).path.lower().endswith(ASSET_EXT)
+
+
+def _links(blob, drop_assets=True):
     blob = (blob or "").replace("&amp;", "&").replace("&#38;", "&")
     out = []
     for u in re.findall(r'https?://[^\s"\'<>)\]]+', blob):
         u = u.rstrip(".,;:)")
+        if drop_assets and _is_asset(u):
+            continue
         if u not in out:
             out.append(u)
     return out
@@ -140,27 +145,28 @@ def _tmp_create(domain=None):
     return j["address"], j["token"]
 
 
-def _tmp_links(token):
-    # the token is base64 and can contain + / = -- unescaped '+' means space
+def _tmp_text(token):
     url = "%s/inbox?token=%s" % (TMP, urllib.parse.quote(token, safe=""))
     j = _j(_open(url)) or {}
     out = []
     for m in j.get("emails") or []:
-        out += _links((m.get("body") or "") + "\n" + (m.get("html") or ""))
+        out.append("SUBJ %s\n%s\n%s" % (m.get("subject") or "",
+                                        m.get("body") or "", m.get("html") or ""))
     if not out and j:
-        out += _links(json.dumps(j))
-    return out
+        out.append(json.dumps(j))
+    return "\n".join(out)
 
 
 # ----------------------------------------------------------------- maildrop
 
-def _md_links(mailbox):
+def _md_text(mailbox):
     q = 'query { inbox(mailbox: "%s") { id subject data html } }' % mailbox
     j = _j(_post(MD, {"query": q})) or {}
     out = []
     for m in (j.get("data", {}) or {}).get("inbox") or []:
-        out += _links((m.get("data") or "") + "\n" + (m.get("html") or ""))
-    return out
+        out.append("SUBJ %s\n%s\n%s" % (m.get("subject") or "",
+                                        m.get("data") or "", m.get("html") or ""))
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------- guerrilla
@@ -176,7 +182,7 @@ def _gm_create(domain):
     return "%s@%s" % (u, domain), sid
 
 
-def _gm_links(sid):
+def _gm_text(sid):
     j = _j(_open("%s?f=check_email&seq=0&sid_token=%s" % (GM, sid))) or {}
     out = []
     for m in j.get("list") or []:
@@ -185,13 +191,14 @@ def _gm_links(sid):
             d = _j(_open("%s?f=fetch_email&email_id=%s&sid_token=%s"
                          % (GM, m["mail_id"], sid))) or {}
             body = d.get("mail_body") or ""
-        out += _links((m.get("mail_excerpt") or "") + "\n" + body)
-    return out
+        out.append("SUBJ %s\n%s\n%s" % (m.get("mail_subject") or "",
+                                        m.get("mail_excerpt") or "", body))
+    return "\n".join(out)
 
 
 # ------------------------------------------------------------------ yopmail
 
-def _yop_links(login):
+def _yop_text(login):
     jar = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     op.open(urllib.request.Request("https://yopmail.com/en/?login=" + login,
@@ -202,17 +209,16 @@ def _yop_links(login):
     ids = re.findall(r'id="(m\d+)"', html) or re.findall(r'id="([a-z]+\d+)"', html)
     for mid in dict.fromkeys(ids):
         try:
-            body = _open("https://yopmail.com/en/inc/mail.html?login=%s&id=%s"
-                         % (login, mid), opener=op)
+            out.append(_open("https://yopmail.com/en/inc/mail.html?login=%s&id=%s"
+                             % (login, mid), opener=op))
         except Exception:
             continue
-        out += _links(body)
     if not out:
         try:
-            out += _links(_open("https://yopmail.com/en/rss.php?login=" + login))
+            out.append(_open("https://yopmail.com/en/rss.php?login=" + login))
         except Exception:
             pass
-    return out
+    return "\n".join(out)
 
 
 # ------------------------------------------------------------------- mail.tm
@@ -220,7 +226,7 @@ def _yop_links(login):
 def _tm_domains(base):
     txt = _open(base + "/domains")
     j = _j(txt)
-    if j is None:                                   # XML fallback
+    if j is None:
         return re.findall(r"<domain>([^<]+)</domain>", txt)
     rows = j if isinstance(j, list) else None
     if rows is None:
@@ -245,7 +251,7 @@ def _tm_create(base, address, password):
     return tok["token"]
 
 
-def _tm_links(base, token):
+def _tm_text(base, token):
     auth = {"Authorization": "Bearer " + token}
     j = _j(_open(base + "/messages", auth))
     msgs = j if isinstance(j, list) else (j or {}).get("hydra:member", [])
@@ -253,9 +259,11 @@ def _tm_links(base, token):
     for m in msgs or []:
         d = _j(_open(base + "/messages/" + m["id"], auth)) or {}
         html = d.get("html") or []
-        body = "\n".join(html) if isinstance(html, list) else str(html)
-        out += _links(body + "\n" + (d.get("text") or ""))
-    return out
+        out.append("SUBJ %s\n%s\n%s" % (d.get("subject") or "",
+                                        d.get("text") or "",
+                                        "\n".join(html) if isinstance(html, list)
+                                        else str(html)))
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------- gmail
@@ -270,7 +278,7 @@ def _gmail_addr(domain):
     return "".join(parts) + "@" + domain
 
 
-def _gmail_links(address):
+def _gmail_text(address):
     import email as _email
     import imaplib
 
@@ -291,14 +299,14 @@ def _gmail_links(address):
                     text = _payload(part)
                 elif ct == "text/html" and not html:
                     html = _payload(part)
-            out += _links(html + "\n" + text)
+            out.append("SUBJ %s\n%s\n%s" % (msg.get("Subject", ""), text, html))
             M.store(num, "+FLAGS", "\\Seen")
     finally:
         try:
             M.logout()
         except Exception:
             pass
-    return out
+    return "\n".join(out)
 
 
 def _payload(part):
@@ -383,38 +391,60 @@ def create_inbox(base, domain):
     return addr, token, base
 
 
-def _poll(base, address, token):
+def _poll_text(base, address, token):
     if base == "tempmail":
-        return _tmp_links(token)
+        return _tmp_text(token)
     if base == "maildrop":
-        return _md_links(address.split("@")[0])
+        return _md_text(address.split("@")[0])
     if base == "guerrilla":
-        return _gm_links(token)
+        return _gm_text(token)
     if base == "yopmail":
-        return _yop_links(address.split("@")[0])
+        return _yop_text(address.split("@")[0])
     if base in TM:
-        return _tm_links(TM[base], token)
+        return _tm_text(TM[base], token)
     if base == "gmail":
-        return _gmail_links(address)
-    return []
+        return _gmail_text(address)
+    return ""
+
+
+def _poll(base, address, token):
+    return _links(_poll_text(base, address, token))
 
 
 def fetch_messages(inbox, token=None, base=None):
-    """bot.py imports this; accepts an inbox dict or (address, token, base)."""
     if isinstance(inbox, dict):
         base = inbox.get("provider") or inbox.get("base") or ""
         token = inbox.get("token")
         inbox = inbox.get("address") or ""
-    return _poll(base, inbox, token)
+    return _links(_poll_text(base, inbox, token))
 
 
 SKIP = ("facebook", "twitter", "instagram", "youtube", "unsubscribe",
         "privacy", "terms", "guerrillamail", "yopmail.com/en")
+HINT = ("activ", "verif", "confirm", "token", "signup", "join", "validate")
+
+CODE_STOP = {"pokemon", "https", "http", "trainer", "central", "please",
+             "account", "verify", "activation", "email", "below", "minutes",
+             "inactive", "complete", "step", "code", "enter", "will", "your",
+             "this", "that", "click", "here", "team", "support", "inc",
+             "nickelodeon", "creatures", "game", "freak", "copyright", "the"}
+
+
+def _score(u):
+    s = 0
+    low = u.lower()
+    if "pokemon" in low:
+        s += 2
+    if any(k in low for k in HINT):
+        s += 3
+    if "static.prod" in low:
+        s -= 1
+    return s
 
 
 def wait_for_link(address, token, base, timeout=180):
     end = time.time() + timeout
-    seen, fallback = set(), None
+    seen, best = set(), None
     while time.time() < end:
         try:
             links = _poll(base, address, token)
@@ -425,42 +455,65 @@ def wait_for_link(address, token, base, timeout=180):
             if l in seen:
                 continue
             seen.add(l)
-            if "pokemon" in l.lower():
-                print("    activation link:", l[:95])
+            if _score(l) >= 4:
+                print("    activation link:", l[:100])
                 return l
-            if not fallback and not any(s in l.lower() for s in SKIP):
-                fallback = l
-        if fallback and time.time() > end - timeout + 60:
-            print("    link (fallback):", fallback[:95])
-            return fallback
+            if not best and not any(s in l.lower() for s in SKIP):
+                best = l
+        if best and time.time() > end - timeout + 60:
+            print("    link (fallback):", best[:100])
+            return best
         time.sleep(6)
-    if fallback:
-        print("    link (late fallback):", fallback[:95])
-    return fallback
+    if best:
+        print("    link (late fallback):", best[:100])
+    return best
 
 
-# --------------------------------------------------------------------- probe
+def _code_from(text):
+    flat = _strip_html(text)
+    m = re.search(r"\b(\d{6})\b", flat)
+    if m:
+        return m.group(1)
+    for w in re.findall(r"\b([A-Za-z0-9]{5,10})\b", flat):
+        if w.lower() in CODE_STOP:
+            continue
+        if any(c.isdigit() for c in w):
+            return w
+    return None
 
-def domain_probe():
-    out = {}
-    for tag in ORDER:
+
+def wait_for_code(address, token, base, timeout=180):
+    end = time.time() + timeout
+    while time.time() < end:
         try:
-            out[tag] = _domains(tag)
+            text = _poll_text(base, address, token)
         except Exception as e:
-            out[tag] = ["ERROR: %s" % e]
-    return out
+            print("    poll error:", e)
+            text = ""
+        if text.strip():
+            print("    mail text:", repr(_strip_html(text)[:220]))
+            code = _code_from(text)
+            if code:
+                print("    code:", code)
+                return code
+        time.sleep(6)
+    print("    no code found")
+    return None
 
 
-list_domains = domain_probe
-wait_for_code = wait_for_link
+list_domains = lambda: {t: _domains(t) for t in ORDER}
 wait_gmail = wait_for_link
-wait_code = wait_for_link
+wait_for_code_alias = wait_for_code
 
 
 if __name__ == "__main__":
     print("--- candidate domains ---")
     total = 0
-    for name, doms in domain_probe().items():
+    for name in ORDER:
+        try:
+            doms = _domains(name)
+        except Exception as e:
+            doms = ["ERROR: %s" % e]
         print("%-10s %s" % (name, doms if doms else "(not configured)"))
         total += len(doms)
     print("total:", total)
