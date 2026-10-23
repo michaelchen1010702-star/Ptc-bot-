@@ -107,13 +107,27 @@ def _links(blob):
     return out
 
 
-def _find_code(blob):
-    txt = re.sub(r"\s+", " ", _clean(blob))
-    for m in re.finditer(r"[Cc]ode[^0-9]{0,60}(\d{6})\b", txt):
-        return m.group(1)
-    for m in re.finditer(r"\b(\d{6})\b", txt):
-        return m.group(1)
-    return None
+def _prep(blob):
+    """Strip CSS colours, tags and entities so only visible text is left."""
+    t = _clean(blob)
+    t = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", t)     # #262626 and friends
+    t = re.sub(r"rgba?\([^)]*\)", " ", t)          # rgb()/rgba()
+    t = re.sub(r"<[^>]+>", " ", t)                 # html tags
+    t = t.replace("&nbsp;", " ").replace("&#160;", " ")
+    return re.sub(r"\s+", " ", t)
+
+
+def _find_codes(blob):
+    """Candidate 6-digit codes, best first."""
+    t = _prep(blob)
+    out = [m.group(1) for m in re.finditer(r"[Cc]ode[^0-9]{0,60}?(\d{6})\b", t)]
+    if out:
+        return out
+    out = [re.sub(r"\s+", "", m.group(1)) for m in
+           re.finditer(r"[Cc]ode[^0-9]{0,60}?((?:\d\s+){5}\d)", t)]
+    if out:
+        return out
+    return [m.group(1) for m in re.finditer(r"\b(\d{6})\b", t)]
 
 
 def _not_asset(u):
@@ -452,19 +466,23 @@ def wait_for_link(address, token, base, timeout=180):
     return fallback
 
 
-def wait_for_code(address, token, base, timeout=300):
-    """Six-digit activation code from the mail."""
+def wait_for_code(address, token, base, timeout=300, avoid=None):
+    """Six-digit activation code. 'avoid' skips a code we already tried."""
     end = time.time() + timeout
-    buf = ""
+    buf, shown = "", False
     while time.time() < end:
         try:
             buf += "\n" + _blob(base, address, token)
         except Exception as e:
             print("    code poll error:", e)
-        code = _find_code(buf)
-        if code:
-            print("    activation code:", code)
-            return code
+        if buf.strip() and not shown:
+            print("    mail text:", _prep(buf)[:260])
+            shown = True
+        for c in _find_codes(buf):
+            if avoid and c == avoid:
+                continue
+            print("    activation code:", c)
+            return c
         time.sleep(6)
     print("    no activation code arrived")
     return None
