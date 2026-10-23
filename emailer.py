@@ -6,6 +6,15 @@ Interface, matching exactly what bot.py calls:
     create_inbox(base, domain)              -> (address, token, base)
     wait_for_link(address, token, base, t)  -> url | None
     wait_for_code(address, token, base, t)  -> "123456" | None
+
+tempmail is the only provider whose domain Pokemon accepts, so it runs
+first AND last, with a hard retry on its API.
+
+Env knobs:
+    TMP_DOMAIN=some.domain     pin a tempmail domain instead of random
+    DOMAIN_ORDER=auto          force a specific domain to the front
+    DOMAIN_BLOCK=a.com,b.com   never use these
+    EMAIL_PROVIDER=tempmail    only this provider
 """
 
 import http.cookiejar
@@ -104,9 +113,9 @@ def _links(blob):
 def _prep(blob):
     """Strip CSS colours, tags and entities so only visible text remains."""
     t = _clean(blob)
-    t = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", t)      # #262626 and friends
-    t = re.sub(r"rgba?\([^)]*\)", " ", t)           # rgb() / rgba()
-    t = re.sub(r"<[^>]+>", " ", t)                  # html tags
+    t = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", t)
+    t = re.sub(r"rgba?\([^)]*\)", " ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
     t = t.replace("&nbsp;", " ").replace("&#160;", " ")
     return re.sub(r"\s+", " ", t)
 
@@ -372,6 +381,10 @@ def list_mailboxes():
     if pref:
         out.sort(key=lambda t: pref.index(t[1].lower())
                  if t[1].lower() in pref else 99)
+    # tempmail is the only working domain pool - give it a second chance
+    # at the end of the sweep instead of ending the run on a transient blip
+    if not want and out and out[-1][0] != "tempmail":
+        out.append(("tempmail", "auto"))
     return out
 
 
@@ -393,12 +406,26 @@ def _create(base, domain):
 
 
 def create_inbox(base, domain):
-    pair = _retry(lambda: _create(base, domain), tries=3,
-                  label="create %s/%s" % (base, domain), pause=2)
-    if not pair:
-        raise RuntimeError("no inbox from %s" % base)
-    addr, token = pair
-    return addr, token, base
+    """tempmail gets a long retry - its API rate-limits under repeat runs."""
+    tries = 6 if base == "tempmail" else 3
+    last = None
+    for i in range(tries):
+        try:
+            pair = _create(base, domain)
+            if pair:
+                return pair[0], pair[1], base
+        except Exception as e:
+            last = e
+            if base == "tempmail":
+                print("  >>> TEMPMAIL RETRY %d/%d: %s" % (i + 1, tries, e))
+                time.sleep(5 * (i + 1))
+            else:
+                print("  create retry %d/%d (%s/%s): %s"
+                      % (i + 1, tries, base, domain, e))
+                time.sleep(2)
+    if last:
+        raise last
+    raise RuntimeError("no inbox from %s" % base)
 
 
 def _blob(base, address, token):
