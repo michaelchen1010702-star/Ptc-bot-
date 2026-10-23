@@ -6,12 +6,6 @@ Interface, matching exactly what bot.py calls:
     create_inbox(base, domain)              -> (address, token, base)
     wait_for_link(address, token, base, t)  -> url | None
     wait_for_code(address, token, base, t)  -> "123456" | None
-
-Env knobs:
-    TMP_DOMAIN=some.domain     pin a tempmail.lol domain instead of random
-    DOMAIN_ORDER=auto          force a specific domain to the front
-    DOMAIN_BLOCK=a.com,b.com   never use these
-    EMAIL_PROVIDER=tempmail    only this provider
 """
 
 import http.cookiejar
@@ -108,17 +102,17 @@ def _links(blob):
 
 
 def _prep(blob):
-    """Strip CSS colours, tags and entities so only visible text is left."""
+    """Strip CSS colours, tags and entities so only visible text remains."""
     t = _clean(blob)
-    t = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", t)     # #262626 and friends
-    t = re.sub(r"rgba?\([^)]*\)", " ", t)          # rgb()/rgba()
-    t = re.sub(r"<[^>]+>", " ", t)                 # html tags
+    t = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", t)      # #262626 and friends
+    t = re.sub(r"rgba?\([^)]*\)", " ", t)           # rgb() / rgba()
+    t = re.sub(r"<[^>]+>", " ", t)                  # html tags
     t = t.replace("&nbsp;", " ").replace("&#160;", " ")
     return re.sub(r"\s+", " ", t)
 
 
 def _find_codes(blob):
-    """Candidate 6-digit codes, best first."""
+    """Candidate 6-digit codes, most likely first."""
     t = _prep(blob)
     out = [m.group(1) for m in re.finditer(r"[Cc]ode[^0-9]{0,60}?(\d{6})\b", t)]
     if out:
@@ -437,7 +431,6 @@ SKIP = ("facebook", "twitter", "instagram", "youtube", "unsubscribe",
 
 
 def wait_for_link(address, token, base, timeout=180):
-    """Real target URL from the mail. Fonts/stylesheets are ignored."""
     end = time.time() + timeout
     seen, fallback = set(), None
     while time.time() < end:
@@ -467,7 +460,7 @@ def wait_for_link(address, token, base, timeout=180):
 
 
 def wait_for_code(address, token, base, timeout=300, avoid=None):
-    """Six-digit activation code. 'avoid' skips a code we already tried."""
+    """Six-digit activation code. 'avoid' skips a code already tried."""
     end = time.time() + timeout
     buf, shown = "", False
     while time.time() < end:
@@ -476,7 +469,7 @@ def wait_for_code(address, token, base, timeout=300, avoid=None):
         except Exception as e:
             print("    code poll error:", e)
         if buf.strip() and not shown:
-            print("    mail text:", _prep(buf)[:260])
+            print("    mail text:", _prep(buf)[:300])
             shown = True
         for c in _find_codes(buf):
             if avoid and c == avoid:
