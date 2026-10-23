@@ -494,6 +494,7 @@ def click_text(page, text, pause=(2.0, 3.2)):
     return False
 
 def code_input(page):
+    """Find the activation-code field, whatever Pokemon decided to call it."""
     for sel in ['input[name*="code" i]', 'input[id*="code" i]',
                 'input[placeholder*="code" i]', 'input[maxlength="6"]',
                 'input[autocomplete="one-time-code"]']:
@@ -518,10 +519,6 @@ def enter_code(page, code):
     if not el:
         print("  no code input found")
         return False
-    try:
-        print("  code field:", el.get_attribute("name") or el.get_attribute("id"))
-    except Exception:
-        pass
     try:
         type_text(page, el, code, lo=40, hi=90)
     except Exception as e:
@@ -643,4 +640,153 @@ def one_account(page, acc):
 
         filled = {}
         filled["username"] = fill_label(page, "username", acc["username"])
-        filled["password"] = fill_label(page, "password", acc["password
+        filled["password"] = fill_label(page, "password", acc["password"])
+        filled["email"]    = fill_label(page, "email", acc["email"])
+        print("  filled:", filled)
+        if not all(filled.values()):
+            print("  field fill failed, retrying page")
+            continue
+
+        print("  terms ticked:", check_label(page, "terms"))
+
+        for _ in range(6):
+            tok = find_any(page, 'input[name="recaptcha-token"]')
+            try:
+                if tok and (tok.input_value() or "").strip():
+                    break
+            except Exception:
+                pass
+            time.sleep(0.8)
+
+        t_submit = time.time() - t0
+        print("  time to submit: %.1fs   reese84 len=%d" % (t_submit, len(reese_value(page))))
+
+        click_text(page, "Continue", pause=(3.5, 5.0))
+        print("  after submit url:", page.url)
+        page_text(page)
+        dump_errors(page)
+        snap(page, f"{acc['username']}_submitted")
+
+        if blocked_page(page):
+            print("  >>> IMPERVA BLOCK")
+            time.sleep(4)
+            if not blocked_page(page):
+                print("  block cleared on its own")
+            else:
+                try:
+                    page.context.clear_cookies()
+                    print("  cookies cleared")
+                except Exception:
+                    pass
+                time.sleep(random.uniform(25, 40))
+                continue
+
+        body = page.content().lower()
+        if "not valid" in body or "creation failed" in body:
+            print("  >>> EMAIL REJECTED BY SITE")
+            return "bad_email"
+        if "already taken" in body:
+            print("  >>> username taken")
+            return "failed"
+
+        # ---- Pokemon emails a 6-digit activation code
+        if "activation code" in body or "verify your email" in body:
+            print("  >>> ACTIVATION CODE STEP")
+            code = wait_for_code(acc["email"], acc["mail_token"],
+                                 acc["mail_base"], timeout=300)
+            if not code:
+                print("  no code")
+                return "created"
+            if not enter_code(page, code):
+                return "created"
+            time.sleep(4)
+            page_text(page)
+            snap(page, f"{acc['username']}_activated")
+            now = page.content().lower()
+            if "invalid" in now or "incorrect" in now or "expired" in now:
+                print("  >>> CODE REJECTED")
+                return "created"
+            if "activation code" in now:
+                print("  >>> still asking for a code")
+                return "created"
+            print("  activated")
+            return "ok"
+
+        # ---- otherwise fall back to a link in the mail
+        print("  waiting for email...")
+        link = wait_for_link(acc["email"], acc["mail_token"], acc["mail_base"],
+                             timeout=150)
+        if not link:
+            print("  no email")
+            return "failed"
+        print("  link:", link[:80])
+        page.goto(link, wait_until="domcontentloaded", timeout=90000)
+        time.sleep(3)
+        print("  activated")
+        return "ok"
+
+    return "failed"
+
+def main():
+    results = []
+    with sync_playwright() as p:
+        ctx = launch(p)
+        ctx.add_init_script("""
+            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+            window.chrome = window.chrome || {};
+            window.chrome.runtime = window.chrome.runtime || {};
+        """)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        try:
+            print("  ua:", page.evaluate("navigator.userAgent"))
+        except Exception:
+            pass
+
+        boxes = list_mailboxes()
+        print("mailboxes to try:", boxes)
+        if not boxes:
+            print("NO MAIL DOMAINS AVAILABLE")
+            return
+
+        for i in range(COUNT):
+            print(f"[{i+1}/{COUNT}] start")
+            for base, domain in boxes:
+                acc = {"username": random_username(), "password": random_password()}
+                try:
+                    acc["email"], acc["mail_token"], acc["mail_base"] = create_inbox(base, domain)
+                except Exception as e:
+                    print("  inbox failed:", base, domain, e)
+                    continue
+                print("  trying email:", acc["email"])
+
+                try:
+                    status = one_account(page, acc)
+                except PWTimeout as e:
+                    print("  timeout:", e); status = "timeout"
+                except Exception as e:
+                    print("  error:", repr(e)); status = "error"
+
+                acc["status"] = status
+                results.append(acc)
+                push({k: acc[k] for k in ("username", "password", "email", "status")})
+                with open(OUT, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
+                                       extrasaction="ignore")
+                    w.writeheader(); w.writerows(results)
+                print(f"  -> {acc['username']} [{status}]")
+
+                if status in ("ok", "created"):
+                    break
+                if status != "bad_email":
+                    break
+                print("  domain rejected, trying next...")
+                time.sleep(3)
+            time.sleep(PAUSE)
+
+        ctx.close()
+    print("done:", OUT)
+
+from emailer import (create_inbox, fetch_messages, wait_for_link,
+                     wait_for_code, wait_gmail, list_domains, list_mailboxes)
+if __name__ == "__main__":
+    main()
