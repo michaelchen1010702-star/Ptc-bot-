@@ -23,6 +23,7 @@ jobs:
       SHEETS_TOKEN: ${{ secrets.SHEETS_TOKEN }}
       COUNT: ${{ github.event.inputs.count || '1' }}
       DOMAIN_ORDER: auto
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
