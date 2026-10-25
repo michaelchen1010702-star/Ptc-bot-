@@ -8,7 +8,7 @@ Interface, matching exactly what bot.py calls:
     wait_for_code(address, token, base, t)  -> "123456" | None
 
 tempmail is the only provider whose domain Pokemon accepts, so it runs
-first AND last, with a hard retry on its API.
+first AND last, tries two independent endpoints, and retries hard.
 
 Env knobs:
     TMP_DOMAIN=some.domain     pin a tempmail domain instead of random
@@ -48,6 +48,7 @@ TM = {"mailtm": "https://api.mail.tm", "mailgw": "https://api.mail.gw"}
 GM = "https://api.guerrillamail.com/ajax.php"
 MD = "https://api.maildrop.cc/graphql"
 TMP = "https://api.tempmail.lol/v2"
+TMPV1 = "https://api.tempmail.lol/generate"
 
 GM_DOMAINS = ["guerrillamailblock.com", "sharklasers.com", "grr.la",
               "guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
@@ -161,14 +162,27 @@ def _retry(fn, tries=4, label="", pause=3):
 # --------------------------------------------------------------- tempmail.lol
 
 def _tmp_create(domain=None):
+    """v2 create first, then the v1 generate endpoint as a fallback."""
     body = {}
     if domain and domain != "auto":
         body["domain"] = domain
-    j = _j(_post(TMP + "/inbox/create", body)) or {}
-    if not j.get("address"):
-        raise RuntimeError("tempmail: %s" % j)
-    print("    tempmail gave: %s" % j["address"])
-    return j["address"], j["token"]
+    err = ""
+    try:
+        j = _j(_post(TMP + "/inbox/create", body)) or {}
+        if j.get("address") and j.get("token"):
+            print("    tempmail gave: %s" % j["address"])
+            return j["address"], j["token"]
+        err = "v2 empty: %s" % j
+    except Exception as e:
+        err = "v2: %s" % e
+    try:
+        j = _j(_open(TMPV1)) or {}
+        if j.get("address") and j.get("token"):
+            print("    tempmail gave (v1): %s" % j["address"])
+            return j["address"], j["token"]
+        raise RuntimeError("v1 empty: %s" % j)
+    except Exception as e:
+        raise RuntimeError("%s | v1: %s" % (err, e))
 
 
 def _tmp_text(token):
@@ -406,26 +420,24 @@ def _create(base, domain):
 
 
 def create_inbox(base, domain):
-    """tempmail gets a long retry - its API rate-limits under repeat runs."""
-    tries = 6 if base == "tempmail" else 3
+    """tempmail gets 8 tries across two endpoints - it rate-limits."""
+    if base != "tempmail":
+        pair = _retry(lambda: _create(base, domain), tries=3,
+                      label="create %s/%s" % (base, domain), pause=2)
+        if not pair:
+            raise RuntimeError("no inbox from %s" % base)
+        return pair[0], pair[1], base
     last = None
-    for i in range(tries):
+    for i in range(8):
         try:
             pair = _create(base, domain)
             if pair:
                 return pair[0], pair[1], base
         except Exception as e:
             last = e
-            if base == "tempmail":
-                print("  >>> TEMPMAIL RETRY %d/%d: %s" % (i + 1, tries, e))
-                time.sleep(5 * (i + 1))
-            else:
-                print("  create retry %d/%d (%s/%s): %s"
-                      % (i + 1, tries, base, domain, e))
-                time.sleep(2)
-    if last:
-        raise last
-    raise RuntimeError("no inbox from %s" % base)
+            print("  >>> TEMPMAIL RETRY %d/8: %s" % (i + 1, e))
+            time.sleep(min(20, 4 * (i + 1)))
+    raise last
 
 
 def _blob(base, address, token):
