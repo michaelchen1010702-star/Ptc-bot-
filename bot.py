@@ -75,6 +75,18 @@ def page_text(page):
     except Exception:
         pass
 
+def blank_report(page):
+    """What is actually on a page that rendered nothing?"""
+    try:
+        t = re.sub(r"\s+", " ", page.inner_text("body")).strip()
+    except Exception:
+        t = ""
+    print("  blank page  url=%s  text=%r" % (page.url, t[:140]))
+    try:
+        print("  frames:", [(f.url or "")[:70] for f in all_frames(page)])
+    except Exception:
+        pass
+
 def dump_errors(page):
     for fr in all_frames(page):
         try:
@@ -578,6 +590,28 @@ def launch(p):
             print("  launch failed:", label, e)
     raise RuntimeError("no browser would launch")
 
+def get_form(page, tries=4):
+    """Load the signup page, reloading through Imperva's blank interstitial."""
+    for rnd in range(tries):
+        state = wait_for_ready(page, 40)
+        print("  state:", state)
+        if state == "form":
+            return True
+        if state == "captcha":
+            try:
+                solve_any(page, wait=4)
+            except CaptchaFail as e:
+                print("  captcha fail:", e)
+            time.sleep(3)
+            continue
+        blank_report(page)
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print("  reload failed:", e)
+        time.sleep(random.uniform(4, 7))
+    return field_count(page) > 0
+
 def one_account(page, acc):
     for attempt in range(6):
         t0 = time.time()
@@ -598,24 +632,15 @@ def one_account(page, acc):
         time.sleep(random.uniform(3.5, 5.0))
         print("  landed on:", page.url)
 
-        for _ in range(3):
-            state = wait_for_ready(page, 45)
-            print("  state:", state)
-            if state == "form":
-                break
-            if state == "captcha":
-                try:
-                    solve_any(page, wait=4)
-                except CaptchaFail as e:
-                    print("  captcha fail:", e)
-                time.sleep(3)
-                continue
-            time.sleep(6)
-
-        if field_count(page) == 0:
-            print("  still no form")
+        if not get_form(page):
+            print("  still no form, retrying account")
             snap(page, f"{acc['username']}_nofields")
-            return "failed"
+            try:
+                page.context.clear_cookies()
+            except Exception:
+                pass
+            time.sleep(random.uniform(8, 14))
+            continue
 
         wait_for_reese(page, 15)
 
