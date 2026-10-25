@@ -784,7 +784,13 @@ def main():
             time.sleep(PAUSE)
 
         ctx.close()
+
+    good = [r for r in results if r.get("status") in ("ok", "created")]
     print("done:", OUT)
+    print("created %d of %d account(s)" % (len(good), len(results)))
+    if not good:
+        print("NO ACCOUNT CREATED - failing the job")
+        raise SystemExit(1)
 
 from emailer import (create_inbox, fetch_messages, wait_for_link,
                      wait_for_code, wait_gmail, list_domains, list_mailboxes)
