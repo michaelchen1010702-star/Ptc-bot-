@@ -75,17 +75,24 @@ def page_text(page):
     except Exception:
         pass
 
+def incapsula_frame(page):
+    """Imperva's reese84 challenge frame, if it is on the page."""
+    for f in all_frames(page):
+        if "_Incapsula_Resource" in (f.url or "") or "incapsula" in (f.url or "").lower():
+            return f
+    return None
+
 def blank_report(page):
-    """What is actually on a page that rendered nothing?"""
     try:
         t = re.sub(r"\s+", " ", page.inner_text("body")).strip()
     except Exception:
         t = ""
-    print("  blank page  url=%s  text=%r" % (page.url, t[:140]))
     try:
-        print("  frames:", [(f.url or "")[:70] for f in all_frames(page)])
+        h = len(page.content())
     except Exception:
-        pass
+        h = 0
+    print("  blank: url=%s  visible=%r  html=%dB" % (page.url, t[:110], h))
+    print("  challenge frame:", "yes" if incapsula_frame(page) else "no")
 
 def dump_errors(page):
     for fr in all_frames(page):
@@ -392,14 +399,14 @@ def reese_value(page):
             return c.get("value") or ""
     return ""
 
-def wait_for_reese(page, timeout=15):
+def wait_for_reese(page, timeout=20):
     end = time.time() + timeout
     while time.time() < end:
         if reese_value(page):
             print("  reese84 present")
             return True
         time.sleep(0.5)
-    print("  no reese84 - cookies: %s" % cookie_names(page))
+    print("  no reese84")
     return False
 
 def type_text(page, el, text, lo=20, hi=60):
@@ -567,7 +574,6 @@ def launch(p):
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
-        "--disable-features=IsolateOrigins,site-per-process",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
@@ -590,30 +596,38 @@ def launch(p):
             print("  launch failed:", label, e)
     raise RuntimeError("no browser would launch")
 
-def get_form(page, tries=4):
-    """Load the signup page, reloading through Imperva's blank interstitial."""
+def get_form(page, tries=2, patience=100):
+    """Imperva's reese84 challenge needs TIME. Do not reload it early."""
     for rnd in range(tries):
-        state = wait_for_ready(page, 40)
-        print("  state:", state)
-        if state == "form":
-            return True
-        if state == "captcha":
-            try:
-                solve_any(page, wait=4)
-            except CaptchaFail as e:
-                print("  captcha fail:", e)
-            time.sleep(3)
-            continue
+        print("  waiting up to %ds for the challenge to clear..." % patience)
+        end = time.time() + patience
+        tried_captcha = False
+        while time.time() < end:
+            if field_count(page) >= 2:
+                print("  state: form")
+                return True
+            if not tried_captcha and (_frames(page, "hcaptcha.com", "checkbox")
+                                      or _frames(page, "recaptcha", "anchor")):
+                print("  state: captcha")
+                try:
+                    solve_any(page, wait=4)
+                except CaptchaFail as e:
+                    print("  captcha fail:", e)
+                tried_captcha = True
+                continue
+            human_warmup(page, 0.5)
+            time.sleep(2)
+        print("  still blank after %ds" % patience)
         blank_report(page)
         try:
             page.reload(wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
             print("  reload failed:", e)
-        time.sleep(random.uniform(4, 7))
+        time.sleep(random.uniform(5, 8))
     return field_count(page) > 0
 
 def one_account(page, acc):
-    for attempt in range(6):
+    for attempt in range(3):
         t0 = time.time()
         print(f"  --- attempt {attempt + 1} ---")
 
@@ -629,7 +643,6 @@ def one_account(page, acc):
             page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
         except Exception as e:
             print("  goto failed:", e)
-        time.sleep(random.uniform(3.5, 5.0))
         print("  landed on:", page.url)
 
         if not get_form(page):
@@ -639,10 +652,10 @@ def one_account(page, acc):
                 page.context.clear_cookies()
             except Exception:
                 pass
-            time.sleep(random.uniform(8, 14))
+            time.sleep(random.uniform(6, 10))
             continue
 
-        wait_for_reese(page, 15)
+        wait_for_reese(page, 20)
 
         if find_any(page, 'input[name="username"]'):
             print("  already on account step")
@@ -703,7 +716,7 @@ def one_account(page, acc):
                     print("  cookies cleared")
                 except Exception:
                     pass
-                time.sleep(random.uniform(25, 40))
+                time.sleep(random.uniform(20, 30))
                 continue
 
         body = page.content().lower()
