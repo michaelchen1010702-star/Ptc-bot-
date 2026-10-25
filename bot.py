@@ -1,865 +1,638 @@
-import csv, os, random, re, string, subprocess, tempfile, time
+#!/usr/bin/env python3
+"""Pokemon Trainer Club account creator.
+
+join.pokemon.com 4-step wizard -> Imperva/Incapsula challenge -> captcha ->
+submit -> emailed 6-digit activation code -> Google Sheet row.
+"""
+
+import os
+import re
+import sys
+import time
+import random
+import string
+import traceback
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ----------------------------------------------------------------- config
-SIGNUP_URL = "https://join.pokemon.com/"
-WARMUP_URL = "https://www.pokemon.com/us/"
-COUNTRY    = "United States"
-DOB_YEAR, DOB_MONTH, DOB_DAY = 1990, 1, 1
-MONTH_NAME = "January"
-COUNT      = int(os.getenv("COUNT", "1"))
-PAUSE      = 8
-OUT        = "accounts.csv"
-DBG        = "debug"
-PROFILE    = "/tmp/ptcprofile"
+import emailer
 
-SHEETS_URL   = os.getenv("SHEETS_URL", "")
-SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
+# ---------------------------------------------------------------- config
+
+JOIN_URL = "https://join.pokemon.com/"
+PROFILE_DIR = os.path.expanduser("~/.ptc-profile")
+DEBUG_DIR = "debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+COUNT = int(os.environ.get("COUNT", "1") or "1")
+HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+SHEETS_URL = (os.environ.get("SHEETS_URL") or "").strip()
+SHEETS_TOKEN = (os.environ.get("SHEETS_TOKEN") or "").strip()
+
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+)
+
+CHROME_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    # keep the challenge iframe running at full speed in CI
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    # give the fingerprint script a usable GL path
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+    "--window-size=1440,900",
+    "--lang=en-US",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
 
 SYMBOLS = "!@#$%^&*"
-WORDS = ["ash","misty","brock","pika","gengar","eevee","snorlax","gyara",
-         "dragon","mewtwo","lapras","zapdos","onix","psy","golem","machop"]
 
-PROVIDERS = ["https://api.mail.tm", "https://api.mail.gw"]
 
-os.makedirs(DBG, exist_ok=True)
+# ---------------------------------------------------------------- utils
 
-# ------------------------------------------------------------- utilities
-def snap(page, name):
+def log(msg):
+    print(msg, flush=True)
+
+
+def safe_text(page):
     try:
-        page.screenshot(path=f"{DBG}/{name}.png", full_page=True)
-        with open(f"{DBG}/{name}.html", "w") as f:
+        return re.sub(r"\s+", " ", page.inner_text("body"))
+    except Exception:
+        return ""
+
+
+def snap(page, tag):
+    try:
+        page.screenshot(path=os.path.join(DEBUG_DIR, f"{tag}.png"), full_page=True)
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(DEBUG_DIR, f"{tag}.html"), "w", encoding="utf-8") as f:
             f.write(page.content())
-        print(f"  [snap] {name}  url={page.url}")
-    except Exception as e:
-        print("  snap failed:", e)
-
-def all_frames(page):
-    try:
-        return list(page.frames)
-    except Exception:
-        return []
-
-def field_count(page):
-    n = 0
-    for fr in all_frames(page):
-        try:
-            n += len(fr.query_selector_all("input, select"))
-        except Exception:
-            pass
-    return n
-
-def find_any(page, selector):
-    for fr in all_frames(page):
-        try:
-            el = fr.query_selector(selector)
-            if el:
-                return el
-        except Exception:
-            pass
-    return None
-
-def cookie_names(page):
-    try:
-        return sorted({c.get("name", "") for c in page.context.cookies()})
-    except Exception:
-        return []
-
-def page_text(page):
-    try:
-        t = page.inner_text("body")
-        t = re.sub(r"\s+", " ", t).strip()
-        print("  page text:", repr(t[:400]))
     except Exception:
         pass
 
-def incapsula_frame(page):
-    for f in all_frames(page):
-        u = (f.url or "").lower()
-        if "_incapsula_resource" in u or "incapsula" in u:
-            return f
+
+def dump_shell(page):
+    try:
+        html = page.content()
+        log(f"html[{len(html)}B] {re.sub(chr(92) + 's+', ' ', html)[:1500]}")
+    except Exception as e:
+        log(f"html err {e}")
+
+
+def row(email, username, password, status, note=""):
+    return {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "email": email,
+        "username": username,
+        "password": password,
+        "status": status,
+        "note": note,
+    }
+
+
+def sheet_push(r):
+    if not SHEETS_URL:
+        log("sheet: SHEETS_URL unset")
+        return
+    for _ in range(4):
+        try:
+            resp = requests.post(
+                SHEETS_URL, json={"token": SHEETS_TOKEN, "row": r}, timeout=30
+            )
+            if resp.ok:
+                log(f"sheet: ok:1 ({r['status']})")
+                return
+            log(f"sheet: {resp.status_code} {resp.text[:120]}")
+        except Exception as e:
+            log(f"sheet err: {e}")
+        time.sleep(2)
+    log("sheet: FAILED")
+
+
+def rand_user():
+    return "ptc" + "".join(
+        random.choice(string.ascii_lowercase + string.digits) for _ in range(9)
+    )
+
+
+def rand_pass():
+    while True:
+        p = (
+            random.choice(string.ascii_lowercase)
+            + random.choice(string.ascii_uppercase)
+            + random.choice(string.digits)
+            + random.choice(SYMBOLS)
+            + "".join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
+        )
+        if 8 <= len(p) <= 16:
+            return p
+
+
+def _prep(s):
+    s = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", s)
+    s = re.sub(r"rgba?\([^)]*\)", " ", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"&[a-zA-Z]+;", " ", s)
+    return s
+
+
+def extract_code(body):
+    t = _prep(body)
+    for pat in (r"(?i)code[^0-9]{0,25}(\d{6})", r"(?<!\d)(\d{6})(?!\d)"):
+        m = re.search(pat, t)
+        if m:
+            return m.group(1)
     return None
 
-def dump_html(page, n=1500):
-    try:
-        h = re.sub(r"\s+", " ", page.content())
-        print("  html[%d]: %s" % (len(h), h[:n]))
-    except Exception as e:
-        print("  html dump failed:", e)
 
-def blank_report(page):
-    try:
-        t = re.sub(r"\s+", " ", page.inner_text("body")).strip()
-    except Exception:
-        t = ""
-    try:
-        h = len(page.content())
-    except Exception:
-        h = 0
-    print("  blank: url=%s  visible=%r  html=%dB" % (page.url, t[:110], h))
-    print("  challenge frame:", "yes" if incapsula_frame(page) else "no")
-    print("  cookies:", cookie_names(page))
+# ---------------------------------------------------------------- diagnostics
 
 def hook_diag(page):
-    """Watch the console, Incapsula requests, and any failed request."""
     def on_console(msg):
-        try:
-            if msg.type in ("error", "warning"):
-                t = (msg.text or "")[:220]
-                if t:
-                    print("    [console:%s] %s" % (msg.type, t))
-        except Exception:
-            pass
+        if msg.type in ("error", "warning"):
+            log(f"[console:{msg.type}] {msg.text[:220]}")
 
-    def on_response(r):
-        try:
-            u = r.url or ""
-            if "incapsula" in u.lower():
-                print("    [resp %s] %s" % (r.status, u[:110]))
-        except Exception:
-            pass
+    def on_pageerror(err):
+        log(f"[pageerror] {str(err)[:220]}")
+
+    def on_response(resp):
+        u = resp.url
+        if "_Incapsula" in u or "recaptcha" in u or "hcaptcha" in u:
+            log(f"[resp {resp.status}] {u[:170]}")
 
     def on_failed(req):
+        log(f"[reqfail] {req.failure} {req.url[:150]}")
+
+    page.on("console", on_console)
+    page.on("pageerror", on_pageerror)
+    page.on("response", on_response)
+    page.on("requestfailed", on_failed)
+
+
+# ---------------------------------------------------------------- navigation
+
+def goto(page, url, timeout=60000):
+    for wu in ("load", "domcontentloaded", "commit"):
         try:
-            print("    [reqfail] %s %s" % (req.failure, (req.url or "")[:100]))
+            page.goto(url, wait_until=wu, timeout=timeout)
+            return True
+        except PWTimeout:
+            continue
+        except Exception:
+            continue
+    return False
+
+
+def form_present(page):
+    for s in ('#email-field', '[name="email-field"]'):
+        try:
+            if page.locator(s).first.count() and page.locator(s).first.is_visible():
+                return True
         except Exception:
             pass
+    return False
 
+
+def wait_for_form(page, patience=100):
+    end = time.time() + patience
+    while time.time() < end:
+        if form_present(page):
+            return True
+        time.sleep(1)
+    return False
+
+
+def bust_challenge(page):
+    """If the Imperva iframe is present but the body is empty, visit the
+    challenge resource in the top frame, then come back."""
+    for fr in page.frames:
+        if "_Incapsula_Resource" in fr.url:
+            src = fr.url
+            log("challenge bust: navigating to Incapsula resource")
+            goto(page, src)
+            time.sleep(2)
+            goto(page, JOIN_URL)
+            return True
+    return False
+
+
+def get_form(page, tries=3, patience=100):
+    for t in range(tries):
+        log(f"get_form attempt {t + 1}/{tries}")
+        goto(page, JOIN_URL)
+        if wait_for_form(page, patience):
+            return True
+
+        log(f"blank page url={page.url} text='{safe_text(page)[:70]}'")
+        dump_shell(page)
+        log(f"frames: {[f.url[:75] for f in page.frames]}")
+
+        if bust_challenge(page) and wait_for_form(page, patience):
+            log("challenge bust worked")
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- form helpers
+
+def click_text(page, text, timeout=15000):
+    end = time.time() + timeout / 1000.0
+    while time.time() < end:
+        for role in ("button", "link"):
+            try:
+                loc = page.get_by_role(role, name=re.compile(text, re.I)).first
+                if loc.count() and loc.is_visible():
+                    loc.click()
+                    return True
+            except Exception:
+                pass
+        try:
+            loc = page.get_by_text(re.compile(text, re.I)).first
+            if loc.count() and loc.is_visible():
+                loc.click()
+                return True
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return False
+
+
+def type_field(page, name, value, human=True):
+    loc = None
+    for s in (f'#{name}', f'[name="{name}"]'):
+        try:
+            l = page.locator(s).first
+            if l.count() and l.is_visible():
+                loc = l
+                break
+        except Exception:
+            pass
+    if loc is None:
+        return False
+    loc.click()
     try:
-        page.on("console", on_console)
-        page.on("response", on_response)
-        page.on("requestfailed", on_failed)
-    except Exception as e:
-        print("  hook failed:", e)
+        loc.fill("")
+    except Exception:
+        pass
+    if human:
+        page.keyboard.type(value, delay=random.randint(30, 70))
+    else:
+        loc.fill(value)
+    return True
 
-def dump_errors(page):
-    for fr in all_frames(page):
+
+def check_label(page, name):
+    for s in (f'input[name="{name}"]', f'input[id="{name}"]'):
         try:
-            msgs = fr.evaluate("""() => {
-                const out = [];
-                document.querySelectorAll('[class*=error],[class*=invalid],[role=alert],[aria-live]').forEach(e => {
-                    const t = (e.innerText || '').trim();
-                    if (t && t.length < 200) out.push(t);
-                });
-                return out;
-            }""")
-            for m in msgs:
-                print("    error box:", repr(m[:160]))
+            l = page.locator(s).first
+            if l.count():
+                if not l.is_checked():
+                    l.check(force=True)
+                return True
         except Exception:
             pass
-
-# ------------------------------------------------------------ account gen
-def random_username():
-    base = random.choice(WORDS) + random.choice(WORDS)
-    tail = "".join(random.choices(string.digits, k=random.randint(2, 5)))
-    return (base + tail)[:16]
-
-def random_password():
-    lower = random.choice(string.ascii_lowercase)
-    upper = random.choice(string.ascii_uppercase)
-    digit = random.choice(string.digits)
-    sym   = random.choice(SYMBOLS)
-    rest  = "".join(random.choices(string.ascii_letters + string.digits, k=8))
-    pw = list(lower + upper + digit + sym + rest)
-    random.shuffle(pw)
-    return "".join(pw)
-
-# ------------------------------------------------------------- mailboxes
-def list_mailboxes():
-    """Legacy. Overridden by emailer.list_mailboxes on import."""
-    out = []
-    for base in PROVIDERS:
+    for txt in ("Terms", "I agree", "agree"):
         try:
-            r = requests.get(f"{base}/domains", timeout=20).json()
-            ds = [d["domain"] for d in r.get("hydra:member", [])]
-            print(f"  {base}: {ds}")
-            for d in ds:
-                out.append((base, d))
+            l = page.get_by_label(re.compile(txt, re.I)).first
+            if l.count():
+                if not l.is_checked():
+                    l.check(force=True)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def select_any(page, name, value=None, label=None, index=None):
+    for s in (f'[name="{name}"]', f'#{name}'):
+        try:
+            l = page.locator(s).first
+            if not l.count():
+                continue
+            if value is not None:
+                try:
+                    l.select_option(value=value)
+                    return True
+                except Exception:
+                    pass
+            if label is not None:
+                try:
+                    l.select_option(label=label)
+                    return True
+                except Exception:
+                    pass
+            if index is not None:
+                try:
+                    l.select_option(index=index)
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return False
+
+
+def do_age_gate(page):
+    if form_present(page):
+        return True
+    select_any(page, "country-select", value="US", label="United States")
+    select_any(page, "year-select", value=str(random.randint(1990, 2004)))
+    select_any(page, "month-select", value=f"{random.randint(1, 12):02d}")
+    select_any(page, "day-select", value=f"{random.randint(1, 28):02d}")
+    click_text(page, "Continue")
+    time.sleep(2)
+    click_text(page, "Yes, This Is Correct", timeout=8000)
+    time.sleep(2)
+    return True
+
+
+# ---------------------------------------------------------------- captcha
+
+def token_ready(page):
+    for s in ('#recaptcha-token', '[name="g-recaptcha-response"]', '[name="h-captcha-response"]'):
+        try:
+            v = page.eval_on_selector(s, "el => el.value")
+            if v:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def hcaptcha_audio(page):
+    try:
+        import speech_recognition as sr
+    except Exception:
+        return False
+
+    for fr in page.frames:
+        if "hcaptcha" not in fr.url:
+            continue
+        try:
+            btn = fr.locator('#audio-button, button[title*="audio" i], .audio-button').first
+            if btn.count():
+                btn.click()
+                time.sleep(2)
+
+            src = None
+            for s in ("#audio-source", "audio"):
+                try:
+                    el = fr.locator(s).first
+                    if el.count():
+                        src = el.get_attribute("src")
+                        if src:
+                            break
+                except Exception:
+                    pass
+            if not src:
+                continue
+
+            data = requests.get(src, timeout=30).content
+            with open(os.path.join(DEBUG_DIR, "hc.mp3"), "wb") as f:
+                f.write(data)
+
+            rec = sr.Recognizer()
+            with sr.AudioFile(os.path.join(DEBUG_DIR, "hc.mp3")) as srcf:
+                audio = rec.record(srcf)
+            text = rec.recognize_google(audio)
+            log(f"captcha: audio -> {text}")
+
+            box = fr.locator('#audio-response, [name="audio-response"]').first
+            box.click()
+            fr.page.keyboard.type(text.lower())
+            sub = fr.locator("#audio-submit, .audio-submit").first
+            if sub.count():
+                sub.click()
+            time.sleep(3)
+            return True
         except Exception as e:
-            print(f"  {base} failed:", e)
-    return out
+            log(f"captcha audio err: {e}")
+    return False
 
-def create_inbox(base, domain):
-    addr = "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "@" + domain
-    pw = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-    requests.post(f"{base}/accounts", json={"address": addr, "password": pw},
-                  timeout=20).raise_for_status()
-    tok = requests.post(f"{base}/token", json={"address": addr, "password": pw},
-                        timeout=20).json()["token"]
-    return addr, tok, base
 
-def wait_for_link(addr, tok, base, timeout=180):
-    """Legacy. Overridden by emailer.wait_for_link on import."""
-    h = {"Authorization": f"Bearer {tok}"}
+def solve_captcha(page, timeout=90):
     end = time.time() + timeout
-    seen = 0
+    clicked = False
+    while time.time() < end:
+        if token_ready(page):
+            log("captcha: token ready")
+            return True
+
+        for fr in page.frames:
+            if not any(k in fr.url for k in ("hcaptcha", "recaptcha", "hcap")):
+                continue
+            if not clicked:
+                try:
+                    box = fr.locator("#checkbox, .checkbox").first
+                    if box.count() and box.is_visible():
+                        box.click()
+                        clicked = True
+                        log("captcha: clicked checkbox")
+                except Exception:
+                    pass
+        if "challenge" in safe_text(page).lower() or "verify" in safe_text(page).lower():
+            if hcaptcha_audio(page):
+                time.sleep(2)
+        time.sleep(1)
+
+    log("captcha: timeout")
+    return token_ready(page)
+
+
+# ---------------------------------------------------------------- submit
+
+def submit_form(page):
+    for s in ("#submit", 'button[type="submit"]', '[name="submit"]'):
+        try:
+            l = page.locator(s).first
+            if l.count() and l.is_visible():
+                l.click()
+                return True
+        except Exception:
+            pass
+    for t in ("Create Account", "Sign Up", "Continue", "Submit", "Create"):
+        if click_text(page, t, timeout=4000):
+            return True
+    return False
+
+
+def blocked(page):
+    t = safe_text(page).lower()
+    return "apologize for the interruption" in t or "unusual browsing activity" in t
+
+
+def wait_activation(page, timeout=60):
+    end = time.time() + timeout
+    while time.time() < end:
+        t = safe_text(page).lower()
+        if "activation code" in t or "verify your email" in t:
+            return True
+        if blocked(page):
+            return False
+        time.sleep(1)
+    return False
+
+
+def fill_activation(page, code):
+    for s in ('#code', '[name="code"]', '[name="activation-code"]', 'input[inputmode="numeric"]'):
+        try:
+            l = page.locator(s).first
+            if l.count() and l.is_visible():
+                l.click()
+                page.keyboard.type(code, delay=60)
+                break
+        except Exception:
+            pass
+    for t in ("Activate", "Submit", "Continue", "Verify"):
+        if click_text(page, t, timeout=4000):
+            return True
+    return False
+
+
+def read_code_from_mail(inbox, token, timeout=240):
+    end = time.time() + timeout
     while time.time() < end:
         try:
-            r = requests.get(f"{base}/messages", headers=h, timeout=20)
-        except Exception:
-            time.sleep(5)
-            continue
-        if r.status_code == 200:
-            msgs = r.json().get("hydra:member", [])
-            if len(msgs) != seen:
-                seen = len(msgs)
-                print(f"    inbox has {seen} message(s)")
-            for m in msgs:
-                frm = (m.get("from") or {}).get("address", "").lower()
-                subj = (m.get("subject") or "")[:60]
-                print(f"    msg from={frm} subj={subj}")
-                full = requests.get(f"{base}/messages/{m['id']}", headers=h,
-                                    timeout=20).json()
-                html = full.get("html") or []
-                body = " ".join(html) if isinstance(html, list) else str(html)
-                body += " " + (full.get("text") or "")
-                links = re.findall(r'https?://[^\s"\'<>)]+', body)
-                hit = next((l for l in links if "pokemon" in l), None)
-                if hit:
-                    return hit
+            msgs = emailer.fetch_messages(inbox, token)
+        except Exception as e:
+            log(f"mail fetch err: {e}")
+            msgs = []
+        for m in msgs:
+            blob = (m.get("subject", "") + " " + m.get("body", "") + " " + m.get("html", ""))
+            code = extract_code(blob)
+            if code:
+                return code
         time.sleep(5)
     return None
 
-# ---------------------------------------------------------------- captcha
-class CaptchaFail(Exception):
-    pass
 
-def _frames(page, *frags):
-    for f in all_frames(page):
-        u = f.url or ""
-        if all(x in u for x in frags):
-            return f
-    return None
+# ---------------------------------------------------------------- one account
 
-def _click_iframe_at(page, frag, dx=28):
-    for el in page.query_selector_all("iframe"):
-        if frag in (el.get_attribute("src") or ""):
-            b = el.bounding_box()
-            if b:
-                page.mouse.click(b["x"] + dx, b["y"] + b["height"] / 2)
-                return True
-    return False
+def create_account(page, idx):
+    log(f"[{idx}] --- start ---")
+    if not get_form(page):
+        log(f"[{idx}] challenge never resolved")
+        snap(page, f"blank_{idx}")
+        sheet_push(row("", "", "", "blank", "imperva challenge loop"))
+        return False
 
-def _click_first(frame, sels):
-    for s in sels:
-        try:
-            el = frame.query_selector(s)
-            if el:
-                el.click()
-                return True
-        except Exception:
-            pass
-    return False
+    if not form_present(page):
+        do_age_gate(page)
+    if not wait_for_form(page, 30):
+        click_text(page, "Yes, This Is Correct", timeout=5000)
+        wait_for_form(page, 30)
+    if not form_present(page):
+        log(f"[{idx}] form never appeared")
+        snap(page, f"nofields_{idx}")
+        sheet_push(row("", "", "", "nofields", "age gate did not advance"))
+        return False
 
-def _fill_first(frame, sels, text):
-    for s in sels:
-        try:
-            el = frame.query_selector(s)
-            if el:
-                el.fill(text)
-                return True
-        except Exception:
-            pass
-    return False
-
-def _audio_bytes(frame):
-    b64 = frame.evaluate("""async () => {
-        const el = document.querySelector('audio') || document.getElementById('audio-source');
-        if (!el || !el.src) return null;
-        try { const r = await fetch(el.src); const b = await r.arrayBuffer();
-              const u = new Uint8Array(b); let s = '';
-              for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
-              return btoa(s); } catch (e) { return null; }
-    }""")
-    if not b64:
-        return None
-    import base64
-    return base64.b64decode(b64)
-
-def _transcribe(data):
-    import speech_recognition as sr
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-        f.write(data)
-        src = f.name
-    wav = src + ".wav"
-    subprocess.run(["ffmpeg", "-y", "-i", src, "-ar", "16000", "-ac", "1", wav],
-                   capture_output=True)
     try:
-        r = sr.Recognizer()
-        with sr.AudioFile(wav) as s:
-            return r.recognize_google(r.record(s))
-    finally:
-        for p in (src, wav):
-            try: os.unlink(p)
-            except Exception: pass
+        inbox, token = emailer.create_inbox()
+    except Exception as e:
+        log(f"[{idx}] inbox fail: {e}")
+        sheet_push(row("", "", "", "error", str(e)[:120]))
+        return False
 
-def solve_recaptcha(page, timeout=90):
-    end = time.time() + timeout
-    anchor = None
-    while time.time() < end and not anchor:
-        anchor = _frames(page, "recaptcha", "anchor")
-        time.sleep(0.5)
-    if not anchor:
-        raise CaptchaFail("no recaptcha")
-    _click_first(anchor, ["#recaptcha-anchor"])
+    user = rand_user()
+    pwd = rand_pass()
+    log(f"[{idx}] email={inbox} user={user}")
+
+    type_field(page, "email-field", inbox)
+    type_field(page, "username-field", user)
+    type_field(page, "password-field", pwd)
+    check_label(page, "terms")
+
+    solve_captcha(page, 90)
+
+    t0 = time.time()
+    submit_form(page)
+    log(f"[{idx}] time to submit: {time.time() - t0:.1f}s")
     time.sleep(3)
-    a = anchor.query_selector("#recaptcha-anchor")
-    if a and a.get_attribute("aria-checked") == "true":
-        return True
-    for _ in range(5):
-        bf = _frames(page, "recaptcha", "bframe")
-        if not bf:
-            time.sleep(2)
-            continue
-        _click_first(bf, ["#recaptcha-audio-button"])
-        time.sleep(3)
-        data = _audio_bytes(bf)
-        if not data:
-            continue
-        try:
-            text = _transcribe(data)
-            print("    heard:", text)
-        except Exception:
-            text = ""
-        if text:
-            _fill_first(bf, ["#audio-response"], text)
-            _click_first(bf, ["#recaptcha-verify-button"])
-            time.sleep(4)
-        a = anchor.query_selector("#recaptcha-anchor")
-        if a and a.get_attribute("aria-checked") == "true":
-            return True
-    raise CaptchaFail("recaptcha failed")
 
-def solve_hcaptcha(page, timeout=180):
-    end = time.time() + timeout
-    for _ in range(25):
-        if time.time() > end:
-            raise CaptchaFail("hcaptcha box missing")
-        fr = _frames(page, "hcaptcha.com", "checkbox")
-        if fr:
-            if _click_first(fr, ["#checkbox", ".checkbox", "[role=checkbox]"]):
-                break
-            if _click_iframe_at(page, "checkbox"):
-                break
-        time.sleep(1)
-    print("    hcaptcha: clicked")
-    for _ in range(15):
-        fr = _frames(page, "hcaptcha.com", "checkbox")
-        if fr:
-            try:
-                el = fr.query_selector("#checkbox")
-                if el and (el.get_attribute("aria-checked") == "true"
-                           or "checked" in (el.get_attribute("class") or "")):
-                    print("    hcaptcha: passed on click")
-                    return True
-            except Exception:
-                pass
-        if _frames(page, "hcaptcha.com", "challenge"):
-            break
-        time.sleep(1)
-    print("    hcaptcha: audio fallback")
-    for _ in range(5):
-        if time.time() > end:
-            break
-        ch = _frames(page, "hcaptcha.com", "challenge")
-        if not ch:
-            time.sleep(2)
-            continue
-        _click_first(ch, ["#audio-button", "[aria-label*='audio' i]", ".audio-button"])
-        time.sleep(3)
-        data = _audio_bytes(ch)
-        if not data:
-            continue
-        try:
-            text = _transcribe(data)
-            print("    heard:", text)
-        except Exception as e:
-            print("    stt:", e)
-            text = ""
-        if text:
-            _fill_first(ch, ["#audio-response", "textarea", "input[type=text]"], text)
-            _click_first(ch, ["#voice-submit", ".button-submit", "button[type=submit]"])
-            time.sleep(4)
-        fr = _frames(page, "hcaptcha.com", "checkbox")
-        if fr:
-            try:
-                el = fr.query_selector("#checkbox")
-                if el and el.get_attribute("aria-checked") == "true":
-                    return True
-            except Exception:
-                pass
-    raise CaptchaFail("hcaptcha failed")
-
-def solve_any(page, wait=6):
-    end = time.time() + wait
-    while time.time() < end:
-        if _frames(page, "hcaptcha.com", "checkbox"):
-            return solve_hcaptcha(page)
-        if _frames(page, "recaptcha", "anchor"):
-            return solve_recaptcha(page)
-        time.sleep(0.5)
-    raise CaptchaFail("no captcha frame found")
-
-# ------------------------------------------------------------- form fill
-def human_warmup(page, seconds=1.2):
-    try:
-        w = page.viewport_size or {"width": 1366, "height": 900}
-        end = time.time() + seconds
-        while time.time() < end:
-            page.mouse.move(random.randint(60, w["width"] - 60),
-                            random.randint(60, w["height"] - 60),
-                            steps=random.randint(4, 10))
-            time.sleep(random.uniform(0.08, 0.2))
-    except Exception:
-        pass
-
-def blocked_page(page):
-    try:
-        return "apologize for the interruption" in page.inner_text("body").lower()
-    except Exception:
+    if blocked(page):
+        log(f"[{idx}] imperva block page")
+        snap(page, f"blocked_{idx}")
+        sheet_push(row(inbox, user, pwd, "blocked", "imperva post block"))
         return False
 
-def reese_value(page):
-    for c in page.context.cookies():
-        if (c.get("name") or "").startswith("reese84"):
-            return c.get("value") or ""
-    return ""
-
-def wait_for_reese(page, timeout=20):
-    end = time.time() + timeout
-    while time.time() < end:
-        if reese_value(page):
-            print("  reese84 present")
-            return True
-        time.sleep(0.5)
-    print("  no reese84")
-    return False
-
-def type_text(page, el, text, lo=20, hi=60):
-    try:
-        el.click()
-    except Exception:
-        pass
-    time.sleep(random.uniform(0.1, 0.25))
-    try:
-        el.fill("")
-    except Exception:
-        pass
-    try:
-        page.keyboard.type(text, delay=random.randint(lo, hi))
-    except Exception:
-        el.fill(text)
-    time.sleep(random.uniform(0.1, 0.3))
-
-def fill_label(page, label, value):
-    xp = ('contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          '"abcdefghijklmnopqrstuvwxyz"),"%s")' % label.lower())
-    for sel in ['input[name="%s"]' % label.lower(),
-                'input[id*="%s"]' % label.lower(),
-                'xpath=//label[%s]/following::input[1]' % xp,
-                'input[placeholder*="%s" i]' % label]:
-        el = find_any(page, sel)
-        if not el:
-            continue
-        try:
-            type_text(page, el, value)
-            return True
-        except Exception:
-            continue
-    return False
-
-def set_select(page, label, value, index_fallback=None):
-    xp = ('contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          '"abcdefghijklmnopqrstuvwxyz"),"%s")' % label.lower())
-    sels = ['xpath=//label[%s]/following::select[1]' % xp,
-            'xpath=//*[self::label or self::span or self::div][%s]/following::select[1]' % xp,
-            'select[name*="%s" i]' % label.lower(),
-            'select[id*="%s" i]' % label.lower(),
-            'select[aria-label*="%s" i]' % label]
-    for sel in sels:
-        el = find_any(page, sel)
-        if not el:
-            continue
-        try:
-            el.select_option(label=value)
-        except Exception:
-            try:
-                el.select_option(value=value)
-            except Exception:
-                if index_fallback is None:
-                    continue
-                try:
-                    el.select_option(index=index_fallback)
-                except Exception:
-                    continue
-        print(f"  set {label} = {value}")
-        return True
-    print(f"  FAILED to set {label}")
-    return False
-
-def check_label(page, label):
-    for sel in [f'input[name="{label}"]', f'input[id="{label}"]',
-                f'input[name*="{label}" i]', f'input[id*="{label}" i]']:
-        el = find_any(page, sel)
-        if el:
-            try:
-                if not el.is_checked():
-                    el.check()
-                print(f"  checked: {label}")
-                return True
-            except Exception:
-                pass
-    xp = ('contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
-          '"abcdefghijklmnopqrstuvwxyz"),"%s")' % label.lower())
-    el = find_any(page, f'xpath=//label[{xp}]/preceding::input[@type="checkbox"][1]')
-    if el:
-        try:
-            if not el.is_checked():
-                el.check()
-            print(f"  checked: {label}")
-            return True
-        except Exception:
-            pass
-    return False
-
-def click_text(page, text, pause=(2.0, 3.2)):
-    for sel in [f'button:has-text("{text}")', f'a:has-text("{text}")',
-                f'input[value*="{text}"]']:
-        el = find_any(page, sel)
-        if not el:
-            continue
-        try:
-            el.click()
-        except Exception:
-            pass
-        time.sleep(random.uniform(*pause))
-        print(f"  clicked: {text}")
-        return True
-    return False
-
-def code_input(page):
-    for sel in ['input[name*="code" i]', 'input[id*="code" i]',
-                'input[placeholder*="code" i]', 'input[maxlength="6"]',
-                'input[autocomplete="one-time-code"]']:
-        el = find_any(page, sel)
-        if el:
-            return el
-    for fr in all_frames(page):
-        try:
-            for inp in fr.query_selector_all("input"):
-                t = (inp.get_attribute("type") or "text").lower()
-                n = ((inp.get_attribute("name") or "")
-                     + (inp.get_attribute("id") or "")).lower()
-                if t in ("text", "tel", "number", "search") and not any(
-                        k in n for k in ("username", "password", "email")):
-                    return inp
-        except Exception:
-            pass
-    return None
-
-def enter_code(page, code):
-    el = code_input(page)
-    if not el:
-        print("  no code input found")
+    txt = safe_text(page).lower()
+    if "not valid" in txt or "already exists" in txt:
+        log(f"[{idx}] email rejected")
+        sheet_push(row(inbox, user, pwd, "bad_email", ""))
         return False
-    try:
-        type_text(page, el, code, lo=40, hi=90)
-    except Exception as e:
-        print("  code fill failed:", e)
+
+    if not wait_activation(page, 60):
+        log(f"[{idx}] no activation page")
+        snap(page, f"noact_{idx}")
+        sheet_push(row(inbox, user, pwd, "created", "no activation page"))
         return False
-    print("  code entered")
-    for txt in ("Continue", "Activate", "Submit", "Verify", "Next"):
-        if click_text(page, txt, pause=(3, 4)):
-            return True
-    try:
-        el.press("Enter")
-        time.sleep(3)
-        print("  pressed Enter")
+
+    log(f"[{idx}] activation page reached")
+    code = read_code_from_mail(inbox, token, 240)
+    log(f"[{idx}] activation code: {code}")
+    if not code:
+        sheet_push(row(inbox, user, pwd, "created", "no code in mail"))
+        return False
+
+    fill_activation(page, code)
+    time.sleep(4)
+    t = safe_text(page).lower()
+    if "thank you" in t or "activated" in t:
+        log(f"[{idx}] -> {user} [ok]")
+        sheet_push(row(inbox, user, pwd, "ok", ""))
         return True
-    except Exception:
-        pass
+
+    log(f"[{idx}] code rejected")
+    snap(page, f"coderej_{idx}")
+    sheet_push(row(inbox, user, pwd, "created", "code rejected"))
     return False
 
-# ---------------------------------------------------------------- sheets
-def push(row):
-    if not SHEETS_URL:
-        print("  sheet: no SHEETS_URL")
-        return
-    try:
-        r = requests.post(SHEETS_URL, json={"token": SHEETS_TOKEN, "accounts": [row]},
-                          allow_redirects=True, timeout=30)
-        print("  sheet:", r.text[:50])
-    except Exception as e:
-        print("  sheet error:", e)
 
-# ------------------------------------------------------------------ main
-def launch(p):
-    args = [
-        "--no-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--window-size=1366,900",
-        "--lang=en-US",
-    ]
-    common = dict(headless=False, args=args,
-                  viewport={"width": 1366, "height": 900},
-                  locale="en-US")
-    for kw in ({"channel": "chrome", "ignore_default_args": ["--enable-automation"]},
-               {"channel": "chrome"},
-               {}):
-        label = (kw.get("channel", "bundled chromium")
-                 + ("+noautomation" if "ignore_default_args" in kw else ""))
-        try:
-            ctx = p.chromium.launch_persistent_context(PROFILE, **common, **kw)
-            print("  browser:", label)
-            return ctx
-        except Exception as e:
-            print("  launch failed:", label, e)
-    raise RuntimeError("no browser would launch")
-
-def get_form(page, tries=2, patience=100):
-    """Imperva's reese84 challenge needs TIME. Do not reload it early."""
-    for rnd in range(tries):
-        print("  waiting up to %ds for the challenge to clear..." % patience)
-        end = time.time() + patience
-        tried_captcha = False
-        while time.time() < end:
-            if field_count(page) >= 2:
-                print("  state: form")
-                return True
-            if not tried_captcha and (_frames(page, "hcaptcha.com", "checkbox")
-                                      or _frames(page, "recaptcha", "anchor")):
-                print("  state: captcha")
-                try:
-                    solve_any(page, wait=4)
-                except CaptchaFail as e:
-                    print("  captcha fail:", e)
-                tried_captcha = True
-                continue
-            # poke the challenge frame occasionally, in case it wants a click
-            if int(time.time()) % 20 == 0:
-                _click_iframe_at(page, "_Incapsula_Resource", dx=20)
-            human_warmup(page, 0.5)
-            time.sleep(2)
-        print("  still blank after %ds" % patience)
-        blank_report(page)
-        dump_html(page)
-        try:
-            page.reload(wait_until="load", timeout=60000)
-        except Exception as e:
-            print("  reload failed:", e)
-        time.sleep(random.uniform(5, 8))
-    return field_count(page) > 0
-
-def one_account(page, acc):
-    for attempt in range(3):
-        t0 = time.time()
-        print(f"  --- attempt {attempt + 1} ---")
-
-        if attempt == 0:
-            try:
-                page.goto(WARMUP_URL, wait_until="load", timeout=60000)
-                time.sleep(random.uniform(2, 4))
-                print("  warmup html=%dB" % len(page.content()))
-            except Exception as e:
-                print("  warmup failed:", e)
-
-        try:
-            page.goto(SIGNUP_URL, wait_until="load", timeout=90000)
-        except Exception as e:
-            print("  goto failed:", e)
-        print("  landed on:", page.url)
-
-        if not get_form(page):
-            print("  still no form, retrying account")
-            snap(page, f"{acc['username']}_nofields")
-            try:
-                page.context.clear_cookies()
-            except Exception:
-                pass
-            time.sleep(random.uniform(6, 10))
-            continue
-
-        wait_for_reese(page, 20)
-
-        if find_any(page, 'input[name="username"]'):
-            print("  already on account step")
-        else:
-            human_warmup(page, 1.0)
-            set_select(page, "country", COUNTRY)
-            set_select(page, "year", str(DOB_YEAR))
-            set_select(page, "month", MONTH_NAME, index_fallback=DOB_MONTH)
-            set_select(page, "day", str(DOB_DAY), index_fallback=DOB_DAY)
-            click_text(page, "Continue")
-            time.sleep(2)
-            if click_text(page, "Yes, This Is Correct"):
-                print("  birthdate confirmed")
-                time.sleep(random.uniform(2.5, 4.0))
-
-        for _ in range(4):
-            if find_any(page, 'input[name="username"]'):
-                break
-            time.sleep(2)
-
-        filled = {}
-        filled["username"] = fill_label(page, "username", acc["username"])
-        filled["password"] = fill_label(page, "password", acc["password"])
-        filled["email"]    = fill_label(page, "email", acc["email"])
-        print("  filled:", filled)
-        if not all(filled.values()):
-            print("  field fill failed, retrying page")
-            continue
-
-        print("  terms ticked:", check_label(page, "terms"))
-
-        for _ in range(6):
-            tok = find_any(page, 'input[name="recaptcha-token"]')
-            try:
-                if tok and (tok.input_value() or "").strip():
-                    break
-            except Exception:
-                pass
-            time.sleep(0.8)
-
-        t_submit = time.time() - t0
-        print("  time to submit: %.1fs   reese84 len=%d" % (t_submit, len(reese_value(page))))
-
-        click_text(page, "Continue", pause=(3.5, 5.0))
-        print("  after submit url:", page.url)
-        page_text(page)
-        dump_errors(page)
-        snap(page, f"{acc['username']}_submitted")
-
-        if blocked_page(page):
-            print("  >>> IMPERVA BLOCK")
-            time.sleep(4)
-            if not blocked_page(page):
-                print("  block cleared on its own")
-            else:
-                try:
-                    page.context.clear_cookies()
-                    print("  cookies cleared")
-                except Exception:
-                    pass
-                time.sleep(random.uniform(20, 30))
-                continue
-
-        body = page.content().lower()
-        if "not valid" in body or "creation failed" in body:
-            print("  >>> EMAIL REJECTED BY SITE")
-            return "bad_email"
-        if "already taken" in body:
-            print("  >>> username taken")
-            return "failed"
-
-        if "activation code" in body or "verify your email" in body:
-            print("  >>> ACTIVATION CODE STEP")
-            code = wait_for_code(acc["email"], acc["mail_token"],
-                                 acc["mail_base"], timeout=300)
-            if not code:
-                print("  no code")
-                return "created"
-            if not enter_code(page, code):
-                return "created"
-            time.sleep(4)
-            page_text(page)
-            snap(page, f"{acc['username']}_activated")
-            now = page.content().lower()
-            if "invalid" in now or "incorrect" in now or "expired" in now:
-                print("  >>> CODE REJECTED")
-                return "created"
-            if "activation code" in now:
-                print("  >>> still asking for a code")
-                return "created"
-            print("  activated")
-            return "ok"
-
-        print("  waiting for email...")
-        link = wait_for_link(acc["email"], acc["mail_token"], acc["mail_base"],
-                             timeout=150)
-        if not link:
-            print("  no email")
-            return "failed"
-        print("  link:", link[:80])
-        page.goto(link, wait_until="domcontentloaded", timeout=90000)
-        time.sleep(3)
-        print("  activated")
-        return "ok"
-
-    return "failed"
+# ---------------------------------------------------------------- main
 
 def main():
-    results = []
-    with sync_playwright() as p:
-        ctx = launch(p)
-        ctx.add_init_script("""
-            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-            window.chrome = window.chrome || {};
-            window.chrome.runtime = window.chrome.runtime || {};
-        """)
+    log(f"count={COUNT} headless={HEADLESS}")
+    ok = 0
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=PROFILE_DIR,
+            channel="chrome",
+            headless=HEADLESS,
+            ignore_default_args=["--enable-automation"],
+            args=CHROME_ARGS,
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
+            viewport={"width": 1440, "height": 900},
+            user_agent=UA,
+        )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         hook_diag(page)
-        try:
-            print("  ua:", page.evaluate("navigator.userAgent"))
-        except Exception:
-            pass
 
-        boxes = list_mailboxes()
-        print("mailboxes to try:", boxes)
-        if not boxes:
-            print("NO MAIL DOMAINS AVAILABLE")
-            return
-
-        for i in range(COUNT):
-            print(f"[{i+1}/{COUNT}] start")
-            for base, domain in boxes:
-                acc = {"username": random_username(), "password": random_password()}
-                try:
-                    acc["email"], acc["mail_token"], acc["mail_base"] = create_inbox(base, domain)
-                except Exception as e:
-                    print("  inbox failed:", base, domain, e)
-                    continue
-                print("  trying email:", acc["email"])
-
-                try:
-                    status = one_account(page, acc)
-                except PWTimeout as e:
-                    print("  timeout:", e); status = "timeout"
-                except Exception as e:
-                    print("  error:", repr(e)); status = "error"
-
-                acc["status"] = status
-                results.append(acc)
-                push({k: acc[k] for k in ("username", "password", "email", "status")})
-                with open(OUT, "w", newline="") as f:
-                    w = csv.DictWriter(f, fieldnames=["username","password","email","status"],
-                                       extrasaction="ignore")
-                    w.writeheader(); w.writerows(results)
-                print(f"  -> {acc['username']} [{status}]")
-
-                if status in ("ok", "created"):
-                    break
-                if status != "bad_email":
-                    break
-                print("  domain rejected, trying next...")
-                time.sleep(3)
-            time.sleep(PAUSE)
+        for i in range(1, COUNT + 1):
+            try:
+                if create_account(page, i):
+                    ok += 1
+            except Exception as e:
+                log(f"[{i}] exception: {e}")
+                traceback.print_exc()
+                snap(page, f"exc_{i}")
+            time.sleep(2)
 
         ctx.close()
 
-    good = [r for r in results if r.get("status") in ("ok", "created")]
-    print("done:", OUT)
-    print("created %d of %d account(s)" % (len(good), len(results)))
-    if not good:
-        print("NO ACCOUNT CREATED - failing the job")
-        raise SystemExit(1)
+    log(f"done: {ok}/{COUNT} accounts created")
+    sys.exit(0 if ok else 1)
 
-from emailer import (create_inbox, fetch_messages, wait_for_link,
-                     wait_for_code, wait_gmail, list_domains, list_mailboxes)
+
 if __name__ == "__main__":
     main()
