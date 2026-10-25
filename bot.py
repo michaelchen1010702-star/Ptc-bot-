@@ -76,11 +76,18 @@ def page_text(page):
         pass
 
 def incapsula_frame(page):
-    """Imperva's reese84 challenge frame, if it is on the page."""
     for f in all_frames(page):
-        if "_Incapsula_Resource" in (f.url or "") or "incapsula" in (f.url or "").lower():
+        u = (f.url or "").lower()
+        if "_incapsula_resource" in u or "incapsula" in u:
             return f
     return None
+
+def dump_html(page, n=1500):
+    try:
+        h = re.sub(r"\s+", " ", page.content())
+        print("  html[%d]: %s" % (len(h), h[:n]))
+    except Exception as e:
+        print("  html dump failed:", e)
 
 def blank_report(page):
     try:
@@ -93,6 +100,39 @@ def blank_report(page):
         h = 0
     print("  blank: url=%s  visible=%r  html=%dB" % (page.url, t[:110], h))
     print("  challenge frame:", "yes" if incapsula_frame(page) else "no")
+    print("  cookies:", cookie_names(page))
+
+def hook_diag(page):
+    """Watch the console, Incapsula requests, and any failed request."""
+    def on_console(msg):
+        try:
+            if msg.type in ("error", "warning"):
+                t = (msg.text or "")[:220]
+                if t:
+                    print("    [console:%s] %s" % (msg.type, t))
+        except Exception:
+            pass
+
+    def on_response(r):
+        try:
+            u = r.url or ""
+            if "incapsula" in u.lower():
+                print("    [resp %s] %s" % (r.status, u[:110]))
+        except Exception:
+            pass
+
+    def on_failed(req):
+        try:
+            print("    [reqfail] %s %s" % (req.failure, (req.url or "")[:100]))
+        except Exception:
+            pass
+
+    try:
+        page.on("console", on_console)
+        page.on("response", on_response)
+        page.on("requestfailed", on_failed)
+    except Exception as e:
+        print("  hook failed:", e)
 
 def dump_errors(page):
     for fr in all_frames(page):
@@ -362,18 +402,6 @@ def solve_any(page, wait=6):
         time.sleep(0.5)
     raise CaptchaFail("no captcha frame found")
 
-def wait_for_ready(page, timeout=60):
-    end = time.time() + timeout
-    while time.time() < end:
-        if field_count(page) >= 2:
-            return "form"
-        if _frames(page, "hcaptcha.com", "checkbox"):
-            return "captcha"
-        if _frames(page, "recaptcha", "anchor"):
-            return "captcha"
-        time.sleep(1.5)
-    return "none"
-
 # ------------------------------------------------------------- form fill
 def human_warmup(page, seconds=1.2):
     try:
@@ -410,7 +438,6 @@ def wait_for_reese(page, timeout=20):
     return False
 
 def type_text(page, el, text, lo=20, hi=60):
-    """ElementHandle has no press_sequentially - focus it and use the keyboard."""
     try:
         el.click()
     except Exception:
@@ -513,7 +540,6 @@ def click_text(page, text, pause=(2.0, 3.2)):
     return False
 
 def code_input(page):
-    """Find the activation-code field, whatever Pokemon decided to call it."""
     for sel in ['input[name*="code" i]', 'input[id*="code" i]',
                 'input[placeholder*="code" i]', 'input[maxlength="6"]',
                 'input[autocomplete="one-time-code"]']:
@@ -615,12 +641,16 @@ def get_form(page, tries=2, patience=100):
                     print("  captcha fail:", e)
                 tried_captcha = True
                 continue
+            # poke the challenge frame occasionally, in case it wants a click
+            if int(time.time()) % 20 == 0:
+                _click_iframe_at(page, "_Incapsula_Resource", dx=20)
             human_warmup(page, 0.5)
             time.sleep(2)
         print("  still blank after %ds" % patience)
         blank_report(page)
+        dump_html(page)
         try:
-            page.reload(wait_until="domcontentloaded", timeout=60000)
+            page.reload(wait_until="load", timeout=60000)
         except Exception as e:
             print("  reload failed:", e)
         time.sleep(random.uniform(5, 8))
@@ -633,14 +663,14 @@ def one_account(page, acc):
 
         if attempt == 0:
             try:
-                page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=60000)
+                page.goto(WARMUP_URL, wait_until="load", timeout=60000)
                 time.sleep(random.uniform(2, 4))
-                print("  warmed up on", WARMUP_URL)
+                print("  warmup html=%dB" % len(page.content()))
             except Exception as e:
                 print("  warmup failed:", e)
 
         try:
-            page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=90000)
+            page.goto(SIGNUP_URL, wait_until="load", timeout=90000)
         except Exception as e:
             print("  goto failed:", e)
         print("  landed on:", page.url)
@@ -727,7 +757,6 @@ def one_account(page, acc):
             print("  >>> username taken")
             return "failed"
 
-        # ---- Pokemon emails a 6-digit activation code
         if "activation code" in body or "verify your email" in body:
             print("  >>> ACTIVATION CODE STEP")
             code = wait_for_code(acc["email"], acc["mail_token"],
@@ -750,7 +779,6 @@ def one_account(page, acc):
             print("  activated")
             return "ok"
 
-        # ---- otherwise fall back to a link in the mail
         print("  waiting for email...")
         link = wait_for_link(acc["email"], acc["mail_token"], acc["mail_base"],
                              timeout=150)
@@ -775,6 +803,7 @@ def main():
             window.chrome.runtime = window.chrome.runtime || {};
         """)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        hook_diag(page)
         try:
             print("  ua:", page.evaluate("navigator.userAgent"))
         except Exception:
