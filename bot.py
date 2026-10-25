@@ -39,11 +39,9 @@ CHROME_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
-    # keep the challenge iframe running at full speed in CI
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
     "--disable-background-timer-throttling",
-    # give the fingerprint script a usable GL path
     "--enable-unsafe-swiftshader",
     "--ignore-gpu-blocklist",
     "--window-size=1440,900",
@@ -53,6 +51,21 @@ CHROME_ARGS = [
 ]
 
 SYMBOLS = "!@#$%^&*"
+MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+AGE_SELECTORS = (
+    "#ageGateSubmit",
+    '[name="ageGateSubmit"]',
+    "#country-select",
+    '[name="country-select"]',
+    "#year-select",
+    '[name="year-select"]',
+    "#month-select",
+    '[name="month-select"]',
+)
 
 
 # ---------------------------------------------------------------- utils
@@ -192,51 +205,73 @@ def goto(page, url, timeout=60000):
     return False
 
 
+# ---------------------------------------------------------------- step detection
+
 def form_present(page):
+    """Account step: email / username / password."""
     for s in ('#email-field', '[name="email-field"]'):
         try:
-            if page.locator(s).first.count() and page.locator(s).first.is_visible():
+            l = page.locator(s).first
+            if l.count() and l.is_visible():
                 return True
         except Exception:
             pass
     return False
 
 
-def wait_for_form(page, patience=100):
+def age_gate_present(page):
+    for s in AGE_SELECTORS:
+        try:
+            l = page.locator(s).first
+            if l.count() and l.is_visible():
+                return True
+        except Exception:
+            pass
+    t = safe_text(page).lower()
+    return "age verification" in t or "date of birth" in t
+
+
+def page_ready(page):
+    """True as soon as ANY signup step has rendered."""
+    return form_present(page) or age_gate_present(page)
+
+
+def wait_for_ready(page, patience=45):
     end = time.time() + patience
     while time.time() < end:
-        if form_present(page):
+        if page_ready(page):
             return True
         time.sleep(1)
     return False
 
 
 def bust_challenge(page):
-    """If the Imperva iframe is present but the body is empty, visit the
-    challenge resource in the top frame, then come back."""
     for fr in page.frames:
         if "_Incapsula_Resource" in fr.url:
-            src = fr.url
-            log("challenge bust: navigating to Incapsula resource")
-            goto(page, src)
+            log("challenge bust: visiting Incapsula resource")
+            goto(page, fr.url)
             time.sleep(2)
             goto(page, JOIN_URL)
             return True
     return False
 
 
-def get_form(page, tries=3, patience=100):
+def get_ready(page, tries=2, patience=45):
     for t in range(tries):
-        log(f"get_form attempt {t + 1}/{tries}")
+        log(f"get_ready attempt {t + 1}/{tries}")
         goto(page, JOIN_URL)
-        if wait_for_form(page, patience):
+        if wait_for_ready(page, patience):
+            log(
+                f"page ready | age_gate={age_gate_present(page)} "
+                f"account_form={form_present(page)}"
+            )
             return True
 
         log(f"blank page url={page.url} text='{safe_text(page)[:70]}'")
         dump_shell(page)
         log(f"frames: {[f.url[:75] for f in page.frames]}")
 
-        if bust_challenge(page) and wait_for_form(page, patience):
+        if bust_challenge(page) and wait_for_ready(page, patience):
             log("challenge bust worked")
             return True
     return False
@@ -312,21 +347,22 @@ def check_label(page, name):
     return False
 
 
-def select_any(page, name, value=None, label=None, index=None):
+def select_any(page, name, values=(), labels=(), index=None):
+    """Try each candidate value, then each label, then a positional index."""
     for s in (f'[name="{name}"]', f'#{name}'):
         try:
             l = page.locator(s).first
             if not l.count():
                 continue
-            if value is not None:
+            for v in values:
                 try:
-                    l.select_option(value=value)
+                    l.select_option(value=v)
                     return True
                 except Exception:
                     pass
-            if label is not None:
+            for lb in labels:
                 try:
-                    l.select_option(label=label)
+                    l.select_option(label=lb)
                     return True
                 except Exception:
                     pass
@@ -344,13 +380,43 @@ def select_any(page, name, value=None, label=None, index=None):
 def do_age_gate(page):
     if form_present(page):
         return True
-    select_any(page, "country-select", value="US", label="United States")
-    select_any(page, "year-select", value=str(random.randint(1990, 2004)))
-    select_any(page, "month-select", value=f"{random.randint(1, 12):02d}")
-    select_any(page, "day-select", value=f"{random.randint(1, 28):02d}")
-    click_text(page, "Continue")
+
+    log("age gate: filling")
+    select_any(page, "country-select", values=["US"], labels=["United States"])
+
+    y = random.randint(1990, 2004)
+    m = random.randint(1, 12)
+    d = random.randint(1, 28)
+
+    if not select_any(page, "year-select", values=[str(y)], labels=[str(y)]):
+        log("age gate: year select failed")
+    if not select_any(
+        page,
+        "month-select",
+        values=[f"{m:02d}", str(m)],
+        labels=[MONTH_NAMES[m - 1], f"{m:02d}", str(m)],
+    ):
+        log("age gate: month select failed")
+    if not select_any(page, "day-select", values=[f"{d:02d}", str(d)], labels=[str(d)]):
+        log("age gate: day select failed")
+
+    clicked = False
+    for s in ('#ageGateSubmit', '[name="ageGateSubmit"]', 'button[type="submit"]'):
+        try:
+            l = page.locator(s).first
+            if l.count() and l.is_visible():
+                l.click()
+                clicked = True
+                break
+        except Exception:
+            pass
+    if not clicked:
+        click_text(page, "Continue")
+    log("age gate: submitted")
+
     time.sleep(2)
-    click_text(page, "Yes, This Is Correct", timeout=8000)
+    if click_text(page, "Yes, This Is Correct", timeout=8000):
+        log("age gate: confirmed")
     time.sleep(2)
     return True
 
@@ -439,7 +505,8 @@ def solve_captcha(page, timeout=90):
                         log("captcha: clicked checkbox")
                 except Exception:
                     pass
-        if "challenge" in safe_text(page).lower() or "verify" in safe_text(page).lower():
+        t = safe_text(page).lower()
+        if "challenge" in t or "verify" in t:
             if hcaptcha_audio(page):
                 time.sleep(2)
         time.sleep(1)
@@ -519,19 +586,22 @@ def read_code_from_mail(inbox, token, timeout=240):
 
 def create_account(page, idx):
     log(f"[{idx}] --- start ---")
-    if not get_form(page):
-        log(f"[{idx}] challenge never resolved")
+
+    if not get_ready(page):
+        log(f"[{idx}] page never rendered (imperva challenge)")
         snap(page, f"blank_{idx}")
         sheet_push(row("", "", "", "blank", "imperva challenge loop"))
         return False
 
     if not form_present(page):
         do_age_gate(page)
-    if not wait_for_form(page, 30):
+
+    if not wait_for_ready(page, 30):
         click_text(page, "Yes, This Is Correct", timeout=5000)
-        wait_for_form(page, 30)
+        wait_for_ready(page, 30)
+
     if not form_present(page):
-        log(f"[{idx}] form never appeared")
+        log(f"[{idx}] account form never appeared")
         snap(page, f"nofields_{idx}")
         sheet_push(row("", "", "", "nofields", "age gate did not advance"))
         return False
