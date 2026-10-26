@@ -480,7 +480,6 @@ def recaptcha_info(page):
 
 
 def ensure_recaptcha(page, patience=25):
-    """Make sure the Enterprise script is present BEFORE the form is filled."""
     if recaptcha_info(page) != "none":
         log("grecaptcha: already loaded")
         return True
@@ -576,8 +575,7 @@ def solve_captcha(page, timeout=20):
 
 
 def prewarm_api(page):
-    """api.join.pokemon.com is a separate host with its own Imperva cookies.
-    Visit it in a second tab so the challenge for that host resolves early."""
+    """api.join.pokemon.com is a separate host with its own Imperva cookies."""
     try:
         cookies = page.context.cookies(API_URL)
         log(f"api cookies before: {[c['name'] for c in cookies]}")
@@ -639,6 +637,21 @@ def after_submit_state(page, timeout=45):
     return "still_form" if form_present(page) else "unknown"
 
 
+def back_to_form(page):
+    """Get back to the account form after an error page."""
+    click_text(page, "Use a Different Email", timeout=5000)
+    if wait_for_ready(page, 20) and form_present(page):
+        return True
+
+    goto(page, JOIN_URL)
+    if not wait_for_ready(page, 45):
+        return False
+    if not form_present(page):
+        do_age_gate(page)
+        wait_for_ready(page, 30)
+    return form_present(page)
+
+
 def fill_activation(page, code):
     for s in ('#code', '[name="code"]', '[name="activation-code"]', 'input[inputmode="numeric"]'):
         try:
@@ -696,26 +709,28 @@ def create_account(page, idx):
         sheet_push(row("", "", "", "nofields", "age gate did not advance"))
         return False
 
-    # get the captcha script in place BEFORE touching the form
     ensure_recaptcha(page)
     prewarm_api(page)
 
-    try:
-        inbox, token = emailer.create_inbox()
-    except Exception as e:
-        log(f"[{idx}] inbox fail: {e}")
-        sheet_push(row("", "", "", "error", str(e)[:120]))
-        return False
-
     user = rand_user()
     pwd = rand_pass()
-    log(f"[{idx}] email={inbox} user={user}")
-
+    inbox = None
+    token = None
     state = "unknown"
+    tried = []
 
-    for attempt in (1, 2, 3):
+    for attempt in range(1, 6):
+        dom = emailer.next_domain()
+        try:
+            inbox, token = emailer.create_inbox(domain=dom)
+        except Exception as e:
+            log(f"[{idx}] inbox fail: {e}")
+            break
+
+        got_dom = inbox.split("@", 1)[1]
+        tried.append(got_dom)
+        log(f"[{idx}] attempt {attempt} email={inbox} user={user}")
         NET["create_user"] = []
-        log(f"[{idx}] attempt {attempt}")
 
         for name, val in (
             ("email-field", inbox),
@@ -728,44 +743,39 @@ def create_account(page, idx):
 
         solve_captcha(page, 15)
 
-        # first POST, then up to 2 fast retries if the edge challenges us
         for sub in range(1, 4):
-            t0 = time.time()
             submit_form(page)
-            log(f"  post {sub} sent in {time.time() - t0:.1f}s")
-
             state = after_submit_state(page, 30)
             log(f"  after post {sub}: {state} | url={page.url}")
-
             if state != "rate_limited":
                 break
-
             log(f"  429 on post {sub} - retrying in 10s")
             time.sleep(10)
 
-        log(f"  page text: {safe_text(page)[:600]}")
+        log(f"  page text: {safe_text(page)[:400]}")
         log(f"  error text: {error_text(page)[:180]}")
-        snap(page, f"after{attempt}_{idx}")
+        snap(page, f"a{attempt}_{idx}")
 
-        if state in ("activation", "bad_email"):
+        if state == "activation":
             break
 
+        if state == "bad_email":
+            log(f"[{idx}] {got_dom} rejected - rotating domain")
+            if not back_to_form(page):
+                log(f"[{idx}] lost the form")
+                break
+            ensure_recaptcha(page)
+            continue
+
         if state == "rate_limited":
-            wait = 45 * attempt
-            log(f"[{idx}] still 429 - cooling {wait}s and clearing cookies")
+            wait = 30 * attempt
+            log(f"[{idx}] still 429 - cooling {wait}s, clearing cookies")
             time.sleep(wait)
             try:
                 page.context.clear_cookies()
-                log("  cookies cleared")
             except Exception:
                 pass
-            goto(page, JOIN_URL)
-            wait_for_ready(page, 45)
-            if not form_present(page):
-                do_age_gate(page)
-                wait_for_ready(page, 30)
-            if not form_present(page):
-                log(f"[{idx}] form lost after cooldown")
+            if not back_to_form(page):
                 break
             ensure_recaptcha(page)
             continue
@@ -773,39 +783,35 @@ def create_account(page, idx):
         if state == "blocked":
             log(f"[{idx}] imperva block - cooling 25s")
             time.sleep(25)
-            goto(page, JOIN_URL)
-            wait_for_ready(page, 45)
-            if not form_present(page):
-                do_age_gate(page)
-                wait_for_ready(page, 30)
-            if not form_present(page):
+            if not back_to_form(page):
                 break
             continue
 
         if state == "still_form":
             log(f"[{idx}] still on form - refilling")
-            time.sleep(8)
+            time.sleep(6)
             continue
 
         break
 
+    if not inbox:
+        sheet_push(row("", "", "", "error", "no inbox"))
+        return False
+
     if state == "rate_limited":
-        log(f"[{idx}] still 429 after 3 attempts")
-        sheet_push(row(inbox, user, pwd, "rate_limited", "create-user 429"))
+        sheet_push(row(inbox, user, pwd, "rate_limited", f"domains={','.join(tried)}"))
         return False
 
     if state == "blocked":
-        log(f"[{idx}] blocked")
-        sheet_push(row(inbox, user, pwd, "blocked", "imperva post block"))
+        sheet_push(row(inbox, user, pwd, "blocked", f"domains={','.join(tried)}"))
         return False
 
     if state == "bad_email":
-        log(f"[{idx}] email rejected by pokemon")
-        sheet_push(row(inbox, user, pwd, "bad_email", error_text(page)[:110]))
+        log(f"[{idx}] all domains rejected: {tried}")
+        sheet_push(row(inbox, user, pwd, "bad_email", f"domains={','.join(tried)}"))
         return False
 
     if state != "activation":
-        log(f"[{idx}] submit never advanced (state={state})")
         snap(page, f"submitfail_{idx}")
         sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
         return False
@@ -852,6 +858,8 @@ def launch(pw):
 
 def main():
     log(f"count={COUNT} headless={HEADLESS}")
+    emailer.prime_domains()
+
     ok = 0
 
     for rnd in (1, 2):
