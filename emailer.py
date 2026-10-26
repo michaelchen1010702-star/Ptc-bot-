@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """Throwaway inbox helpers.
 
-Primary: tempmail.lol (Pokemon accepts some of its domains).
-Fallbacks: mail.tm / mail.gw.
-
-create_inbox(domain=None) -> (address, token_blob)
-fetch_messages(address, token_blob) -> [{"subject","body","html"}]
+Domain pool spans tempmail.lol and mail.tm so we can rotate.
 """
 
 import os
@@ -14,7 +10,6 @@ import socket
 import requests
 from urllib.parse import quote
 
-# ---------------------------------------------------------------- IPv4 force
 _orig_gai = socket.getaddrinfo
 
 
@@ -34,15 +29,12 @@ UA = (
 
 TEMPMAIL_CREATE = "https://api.tempmail.lol/v2/inbox/create"
 
-# fallbacks if the pool sample fails
 SEED_DOMAINS = [
     "lucktaro.com",
     "xzcoot.com",
     "paxeluni.com",
     "kashre.com",
 ]
-
-MAILTM_HOSTS = ["api.mail.tm", "api.mail.gw"]
 
 DOMAIN_POOL = []
 _pool_idx = 0
@@ -68,7 +60,6 @@ def _base_domain(host):
 
 
 def sample_pool(n=6):
-    """Create a few random inboxes and learn which base domains are live."""
     bases = []
     for _ in range(n):
         try:
@@ -81,26 +72,49 @@ def sample_pool(n=6):
                         bases.append(b)
         except Exception:
             pass
-        time.sleep(0.6)
+        time.sleep(0.5)
     return bases
 
 
+def sample_mailtm_domains(host="api.mail.tm", n=10):
+    try:
+        r = _get(f"https://{host}/domains")
+        if not r.ok:
+            return []
+        j = r.json()
+        doms = j.get("hydra:member", j) if isinstance(j, dict) else j
+        out = []
+        for d in doms[:n]:
+            dom = d.get("domain") if isinstance(d, dict) else d
+            if dom:
+                out.append(dom)
+        return out
+    except Exception:
+        return []
+
+
 def prime_domains():
-    """Populate the rotation pool from the live pool, seeded as a fallback."""
     global DOMAIN_POOL, _pool_idx
-    live = sample_pool(6)
     pool = []
-    for d in live + SEED_DOMAINS:
-        if d and d not in pool:
-            pool.append(d)
+
+    for d in sample_pool(6):
+        pool.append({"domain": d, "provider": "tempmail"})
+
+    for d in sample_mailtm_domains("api.mail.tm", 10):
+        if not any(p["domain"] == d for p in pool):
+            pool.append({"domain": d, "provider": "mailtm"})
+
+    for d in SEED_DOMAINS:
+        if not any(p["domain"] == d for p in pool):
+            pool.append({"domain": d, "provider": "tempmail"})
+
     DOMAIN_POOL = pool
     _pool_idx = 0
-    print(f"[emailer] domain pool: {DOMAIN_POOL}", flush=True)
+    print(f"[emailer] domain pool: {[p['domain'] for p in pool]}", flush=True)
     return DOMAIN_POOL
 
 
 def next_domain():
-    """Cycle through the pool, then fall back to a random domain."""
     global _pool_idx
     if not DOMAIN_POOL:
         return None
@@ -168,22 +182,23 @@ def _tempmail_fetch(token):
 
 # ---------------------------------------------------------------- mail.tm / gw
 
-def _mailtm_create(host):
-    doms = _get(f"https://{host}/domains").json()
-    doms = doms.get("hydra:member", doms) if isinstance(doms, dict) else doms
-    domain = doms[0]["domain"]
+def _mailtm_create(host, domain=None):
+    if not domain:
+        doms = _get(f"https://{host}/domains").json()
+        doms = doms.get("hydra:member", doms) if isinstance(doms, dict) else doms
+        domain = doms[0]["domain"]
 
-    for _ in range(4):
-        user = "ptcmail" + str(int(time.time() * 1000) % 100000000)
-        addr = f"{user}@{domain}"
-        pw = "Ptc" + str(int(time.time() * 1000) % 1000000)
+    for _ in range(3):
+        stamp = int(time.time() * 1000) % 100000000
+        addr = f"ptc{stamp}@{domain}"
+        pw = f"Ptc{stamp}"
         r = _post(f"https://{host}/accounts", json={"address": addr, "password": pw})
         if r.status_code in (200, 201):
             t = _post(f"https://{host}/token", json={"address": addr, "password": pw})
             if t.ok:
                 return addr, {"kind": "mailtm", "host": host, "token": t.json()["token"]}
         time.sleep(1)
-    raise RuntimeError(f"{host} create failed")
+    raise RuntimeError(f"{host} create failed for {domain}")
 
 
 def _mailtm_fetch(host, token):
@@ -216,38 +231,51 @@ def _mailtm_fetch(host, token):
 
 # ---------------------------------------------------------------- public API
 
-def create_inbox(domain=None):
-    """Returns (address, token_blob). Tries the given domain, then random,
-    then the v1 endpoint, then mail.tm / mail.gw."""
+def create_inbox(entry=None):
+    """entry is a dict from next_domain(), a domain string, or None."""
+    dom = None
+    prov = "tempmail"
+    if isinstance(entry, dict):
+        dom = entry.get("domain")
+        prov = entry.get("provider", "tempmail")
+    elif isinstance(entry, str):
+        dom = entry
+
     errors = []
 
-    for attempt in range(3):
-        use = domain if attempt == 0 else None
-        try:
-            return _tempmail_create(use)
-        except Exception as e:
-            errors.append(f"tempmail[{use}]: {e}")
-            time.sleep(2)
+    if dom:
+        if prov == "mailtm":
+            try:
+                return _mailtm_create("api.mail.tm", dom)
+            except Exception as e:
+                errors.append(f"mailtm[{dom}]: {e}")
+        else:
+            for _ in range(2):
+                try:
+                    return _tempmail_create(dom)
+                except Exception as e:
+                    errors.append(f"tempmail[{dom}]: {e}")
+                    time.sleep(2)
 
-    for attempt in range(6):
+    for _ in range(4):
         try:
             return _tempmail_create(None)
         except Exception as e:
             errors.append(f"tempmail: {e}")
-            time.sleep(3 + attempt * 2)
+            time.sleep(3)
 
     try:
         return _tempmail_v1()
     except Exception as e:
         errors.append(f"v1: {e}")
 
-    for host in MAILTM_HOSTS:
+    for host in ("api.mail.tm", "api.mail.gw"):
         try:
             return _mailtm_create(host)
         except Exception as e:
             errors.append(f"{host}: {e}")
 
-    raise RuntimeError("no inbox available | " + " ; ".join(errors[-8:]))
+    raise RuntimeError("no inbox available | " + " ; ".join(errors[-6:]))
 
 
 def fetch_messages(address, token=None, base=None):
