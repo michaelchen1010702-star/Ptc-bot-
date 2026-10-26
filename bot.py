@@ -96,7 +96,8 @@ def snap(page, tag):
 def dump_shell(page):
     try:
         html = page.content()
-        log(f"html[{len(html)}B] {re.sub(r'\s+', ' ', html)[:1500]}")
+        flat = re.sub(r"\s+", " ", html)
+        log(f"html[{len(html)}B] {flat[:1500]}")
     except Exception as e:
         log(f"html err {e}")
 
