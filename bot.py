@@ -201,11 +201,27 @@ def hook_diag(page):
     def on_pageerror(err):
         log(f"[pageerror] {str(err)[:220]}")
 
+    def on_request(req):
+        u = req.url
+        if "api.join.pokemon.com" in u:
+            try:
+                body = req.post_data or ""
+            except Exception:
+                body = ""
+            log(f"[req] {req.method} {u[:110]} {body[:320]}")
+
     def on_response(resp):
         u = resp.url
         if "create-user" in u:
             NET["create_user"].append(resp.status)
-            log(f"[resp {resp.status}] {u[:150]}")
+            body = ""
+            try:
+                body = (resp.text() or "")[:400]
+            except Exception:
+                pass
+            log(f"[resp {resp.status}] create-user body={body}")
+        elif "api.join.pokemon.com" in u:
+            log(f"[resp {resp.status}] api {u[:110]}")
         elif "_Incapsula" in u or "recaptcha" in u or "hcaptcha" in u:
             log(f"[resp {resp.status}] {u[:170]}")
 
@@ -214,6 +230,7 @@ def hook_diag(page):
 
     page.on("console", on_console)
     page.on("pageerror", on_pageerror)
+    page.on("request", on_request)
     page.on("response", on_response)
     page.on("requestfailed", on_failed)
 
@@ -343,9 +360,9 @@ def type_field(page, name, value, human=True):
         loc.fill("")
     except Exception:
         pass
-    if human:
+    if human and value:
         page.keyboard.type(value, delay=random.randint(30, 70))
-    else:
+    elif value:
         loc.fill(value)
     return True
 
@@ -575,7 +592,6 @@ def solve_captcha(page, timeout=20):
 
 
 def prewarm_api(page):
-    """api.join.pokemon.com is a separate host with its own Imperva cookies."""
     try:
         cookies = page.context.cookies(API_URL)
         log(f"api cookies before: {[c['name'] for c in cookies]}")
@@ -638,7 +654,6 @@ def after_submit_state(page, timeout=45):
 
 
 def back_to_form(page):
-    """Get back to the account form after an error page."""
     click_text(page, "Use a Different Email", timeout=5000)
     if wait_for_ready(page, 20) and form_present(page):
         return True
@@ -719,10 +734,10 @@ def create_account(page, idx):
     state = "unknown"
     tried = []
 
-    for attempt in range(1, 6):
-        dom = emailer.next_domain()
+    for attempt in range(1, 9):
+        entry = emailer.next_domain()
         try:
-            inbox, token = emailer.create_inbox(domain=dom)
+            inbox, token = emailer.create_inbox(entry)
         except Exception as e:
             log(f"[{idx}] inbox fail: {e}")
             break
@@ -741,9 +756,9 @@ def create_account(page, idx):
         log(f"  email value read back: {field_value(page, 'email-field')}")
         log(f"  terms: {check_label(page, 'terms')}")
 
-        solve_captcha(page, 15)
+        solve_captcha(page, 12)
 
-        for sub in range(1, 4):
+        for sub in range(1, 3):
             submit_form(page)
             state = after_submit_state(page, 30)
             log(f"  after post {sub}: {state} | url={page.url}")
@@ -752,7 +767,6 @@ def create_account(page, idx):
             log(f"  429 on post {sub} - retrying in 10s")
             time.sleep(10)
 
-        log(f"  page text: {safe_text(page)[:400]}")
         log(f"  error text: {error_text(page)[:180]}")
         snap(page, f"a{attempt}_{idx}")
 
@@ -760,21 +774,19 @@ def create_account(page, idx):
             break
 
         if state == "bad_email":
-            log(f"[{idx}] {got_dom} rejected - rotating domain")
-            if not back_to_form(page):
+            log(f"[{idx}] {got_dom} rejected - next domain")
+            if form_present(page):
+                type_field(page, "email-field", "", human=False)
+                time.sleep(1)
+            elif not back_to_form(page):
                 log(f"[{idx}] lost the form")
                 break
-            ensure_recaptcha(page)
             continue
 
         if state == "rate_limited":
             wait = 30 * attempt
-            log(f"[{idx}] still 429 - cooling {wait}s, clearing cookies")
+            log(f"[{idx}] still 429 - cooling {wait}s")
             time.sleep(wait)
-            try:
-                page.context.clear_cookies()
-            except Exception:
-                pass
             if not back_to_form(page):
                 break
             ensure_recaptcha(page)
@@ -789,7 +801,7 @@ def create_account(page, idx):
 
         if state == "still_form":
             log(f"[{idx}] still on form - refilling")
-            time.sleep(6)
+            time.sleep(5)
             continue
 
         break
