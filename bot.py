@@ -67,6 +67,9 @@ AGE_SELECTORS = (
     '[name="month-select"]',
 )
 
+# network observations shared between the response hook and the submit logic
+NET = {"create_user": []}
+
 
 # ---------------------------------------------------------------- utils
 
@@ -79,6 +82,26 @@ def safe_text(page):
         return re.sub(r"\s+", " ", page.inner_text("body"))
     except Exception:
         return ""
+
+
+def error_text(page):
+    """Text of the first visible validation/error element."""
+    for s in (
+        '[role="alert"]',
+        '.error',
+        '.error-message',
+        '[class*="error" i]',
+        '[class*="invalid" i]',
+    ):
+        try:
+            l = page.locator(s).first
+            if l.count() and l.is_visible():
+                t = (l.inner_text() or "").strip()
+                if t:
+                    return re.sub(r"\s+", " ", t)[:200]
+        except Exception:
+            pass
+    return ""
 
 
 def snap(page, tag):
@@ -181,7 +204,10 @@ def hook_diag(page):
 
     def on_response(resp):
         u = resp.url
-        if "_Incapsula" in u or "recaptcha" in u or "hcaptcha" in u:
+        if "create-user" in u:
+            NET["create_user"].append(resp.status)
+            log(f"[resp {resp.status}] {u[:150]}")
+        elif "_Incapsula" in u or "recaptcha" in u or "hcaptcha" in u:
             log(f"[resp {resp.status}] {u[:170]}")
 
     def on_failed(req):
@@ -436,6 +462,30 @@ def token_ready(page):
     return False
 
 
+def recaptcha_info(page):
+    try:
+        return page.evaluate(
+            "() => (window.grecaptcha && grecaptcha.enterprise) ? 'enterprise' : "
+            "(window.grecaptcha ? 'v2/v3' : 'none')"
+        )
+    except Exception:
+        return "eval-fail"
+
+
+def ensure_recaptcha(page):
+    info = recaptcha_info(page)
+    log(f"grecaptcha: {info}")
+    if info != "none":
+        return True
+    try:
+        page.add_script_tag(url="https://www.google.com/recaptcha/enterprise.js")
+        time.sleep(3)
+        log(f"grecaptcha after inject: {recaptcha_info(page)}")
+    except Exception as e:
+        log(f"recaptcha inject fail: {e}")
+    return False
+
+
 def hcaptcha_audio(page):
     try:
         import speech_recognition as sr
@@ -490,15 +540,12 @@ def hcaptcha_audio(page):
 def solve_captcha(page, timeout=20):
     """Best-effort click of an hCaptcha checkbox.
 
-    Invisible reCAPTCHA Enterprise only mints its token on submit, so a
-    timeout here is NOT fatal - we submit anyway and wait after.
+    Invisible reCAPTCHA Enterprise has no checkbox and no recaptcha-token
+    textarea, so a 'no token' result here is expected - never fatal.
     """
     end = time.time() + timeout
     clicked = False
     while time.time() < end:
-        if token_ready(page):
-            log("captcha: token ready")
-            return True
         for fr in page.frames:
             if not any(k in fr.url for k in ("hcaptcha", "recaptcha", "hcap")):
                 continue
@@ -512,7 +559,7 @@ def solve_captcha(page, timeout=20):
                 except Exception:
                     pass
         time.sleep(0.5)
-    log(f"captcha: no token yet (checkbox_clicked={clicked}) - submitting anyway")
+    log(f"captcha: no checkbox (clicked={clicked}) - submitting anyway")
     return token_ready(page)
 
 
@@ -551,15 +598,18 @@ def wait_activation(page, timeout=60):
 
 
 def after_submit_state(page, timeout=45):
-    """Watch what the page does after submit and name the outcome."""
+    """Watch the page and the create-user response, then name the outcome."""
     end = time.time() + timeout
     while time.time() < end:
         if blocked(page):
             return "blocked"
+        if NET["create_user"] and NET["create_user"][-1] == 429:
+            return "rate_limited"
         t = safe_text(page).lower()
         if "activation code" in t or "verify your email" in t:
             return "activation"
-        if "is not valid" in t or "already exists" in t:
+        e = error_text(page).lower()
+        if "already exists" in e or "not valid" in e:
             return "bad_email"
         time.sleep(1)
     return "still_form" if form_present(page) else "unknown"
@@ -635,8 +685,9 @@ def create_account(page, idx):
 
     state = "unknown"
 
-    for attempt in (1, 2):
-        log(f"[{idx}] fill/submit attempt {attempt}")
+    for attempt in (1, 2, 3):
+        NET["create_user"] = []
+        log(f"[{idx}] attempt {attempt}")
 
         for name, val in (
             ("email-field", inbox),
@@ -646,6 +697,7 @@ def create_account(page, idx):
             log(f"  fill {name}: {type_field(page, name, val)}")
         log(f"  terms: {check_label(page, 'terms')}")
 
+        ensure_recaptcha(page)
         solve_captcha(page, 20)
 
         t0 = time.time()
@@ -654,14 +706,29 @@ def create_account(page, idx):
 
         state = after_submit_state(page, 45)
         log(f"  after submit: {state} | url={page.url}")
-        log(f"  page text: {safe_text(page)[:280]}")
+        log(f"  page text: {safe_text(page)[:600]}")
+        log(f"  error text: {error_text(page)[:180]}")
         snap(page, f"after{attempt}_{idx}")
 
         if state in ("activation", "bad_email"):
             break
 
+        if state == "rate_limited":
+            wait = 30 * attempt
+            log(f"[{idx}] create-user 429 - cooling {wait}s")
+            time.sleep(wait)
+            goto(page, JOIN_URL)
+            wait_for_ready(page, 45)
+            if not form_present(page):
+                do_age_gate(page)
+                wait_for_ready(page, 30)
+            if not form_present(page):
+                log(f"[{idx}] form lost after cooldown")
+                break
+            continue
+
         if state == "blocked":
-            log(f"[{idx}] imperva block page - cooling down 25s")
+            log(f"[{idx}] imperva block - cooling 25s")
             time.sleep(25)
             goto(page, JOIN_URL)
             wait_for_ready(page, 45)
@@ -673,20 +740,28 @@ def create_account(page, idx):
             continue
 
         if state == "still_form":
-            log(f"[{idx}] still on form - will refill and resubmit")
-            time.sleep(6)
+            log(f"[{idx}] still on form - refilling")
+            time.sleep(8)
+            continue
+
+        break
+
+    if state == "rate_limited":
+        log(f"[{idx}] still 429 after 3 attempts")
+        sheet_push(row(inbox, user, pwd, "rate_limited", "create-user 429"))
+        return False
 
     if state == "blocked":
-        log(f"[{idx}] blocked after retry")
+        log(f"[{idx}] blocked")
         sheet_push(row(inbox, user, pwd, "blocked", "imperva post block"))
         return False
 
     if state == "bad_email":
         log(f"[{idx}] email rejected by pokemon")
-        sheet_push(row(inbox, user, pwd, "bad_email", safe_text(page)[:100]))
+        sheet_push(row(inbox, user, pwd, "bad_email", error_text(page)[:110]))
         return False
 
-    if state in ("still_form", "unknown"):
+    if state != "activation":
         log(f"[{idx}] submit never advanced (state={state})")
         snap(page, f"submitfail_{idx}")
         sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
