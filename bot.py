@@ -96,7 +96,7 @@ def snap(page, tag):
 def dump_shell(page):
     try:
         html = page.content()
-        log(f"html[{len(html)}B] {re.sub(chr(92) + 's+', ' ', html)[:1500]}")
+        log(f"html[{len(html)}B] {re.sub(r'\s+', ' ', html)[:1500]}")
     except Exception as e:
         log(f"html err {e}")
 
@@ -172,7 +172,8 @@ def extract_code(body):
 def hook_diag(page):
     def on_console(msg):
         if msg.type in ("error", "warning"):
-            log(f"[console:{msg.type}] {msg.text[:220]}")
+            loc = msg.location or {}
+            log(f"[console:{msg.type}] {msg.text[:180]} @ {loc.get('url', '')[:130]}")
 
     def on_pageerror(err):
         log(f"[pageerror] {str(err)[:220]}")
@@ -485,14 +486,18 @@ def hcaptcha_audio(page):
     return False
 
 
-def solve_captcha(page, timeout=90):
+def solve_captcha(page, timeout=20):
+    """Best-effort click of an hCaptcha checkbox.
+
+    Invisible reCAPTCHA Enterprise only mints its token on submit, so a
+    timeout here is NOT fatal - we submit anyway and wait after.
+    """
     end = time.time() + timeout
     clicked = False
     while time.time() < end:
         if token_ready(page):
             log("captcha: token ready")
             return True
-
         for fr in page.frames:
             if not any(k in fr.url for k in ("hcaptcha", "recaptcha", "hcap")):
                 continue
@@ -505,13 +510,8 @@ def solve_captcha(page, timeout=90):
                         log("captcha: clicked checkbox")
                 except Exception:
                     pass
-        t = safe_text(page).lower()
-        if "challenge" in t or "verify" in t:
-            if hcaptcha_audio(page):
-                time.sleep(2)
-        time.sleep(1)
-
-    log("captcha: timeout")
+        time.sleep(0.5)
+    log(f"captcha: no token yet (checkbox_clicked={clicked}) - submitting anyway")
     return token_ready(page)
 
 
@@ -547,6 +547,21 @@ def wait_activation(page, timeout=60):
             return False
         time.sleep(1)
     return False
+
+
+def after_submit_state(page, timeout=45):
+    """Watch what the page does after submit and name the outcome."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if blocked(page):
+            return "blocked"
+        t = safe_text(page).lower()
+        if "activation code" in t or "verify your email" in t:
+            return "activation"
+        if "is not valid" in t or "already exists" in t:
+            return "bad_email"
+        time.sleep(1)
+    return "still_form" if form_present(page) else "unknown"
 
 
 def fill_activation(page, code):
@@ -617,34 +632,63 @@ def create_account(page, idx):
     pwd = rand_pass()
     log(f"[{idx}] email={inbox} user={user}")
 
-    type_field(page, "email-field", inbox)
-    type_field(page, "username-field", user)
-    type_field(page, "password-field", pwd)
-    check_label(page, "terms")
+    state = "unknown"
 
-    solve_captcha(page, 90)
+    for attempt in (1, 2):
+        log(f"[{idx}] fill/submit attempt {attempt}")
 
-    t0 = time.time()
-    submit_form(page)
-    log(f"[{idx}] time to submit: {time.time() - t0:.1f}s")
-    time.sleep(3)
+        for name, val in (
+            ("email-field", inbox),
+            ("username-field", user),
+            ("password-field", pwd),
+        ):
+            log(f"  fill {name}: {type_field(page, name, val)}")
+        log(f"  terms: {check_label(page, 'terms')}")
 
-    if blocked(page):
-        log(f"[{idx}] imperva block page")
-        snap(page, f"blocked_{idx}")
+        solve_captcha(page, 20)
+
+        t0 = time.time()
+        submit_form(page)
+        log(f"  submitted in {time.time() - t0:.1f}s")
+
+        state = after_submit_state(page, 45)
+        log(f"  after submit: {state} | url={page.url}")
+        log(f"  page text: {safe_text(page)[:280]}")
+        snap(page, f"after{attempt}_{idx}")
+
+        if state in ("activation", "bad_email"):
+            break
+
+        if state == "blocked":
+            log(f"[{idx}] imperva block page - cooling down 25s")
+            time.sleep(25)
+            goto(page, JOIN_URL)
+            wait_for_ready(page, 45)
+            if not form_present(page):
+                do_age_gate(page)
+                wait_for_ready(page, 30)
+            if not form_present(page):
+                break
+            continue
+
+        if state == "still_form":
+            log(f"[{idx}] still on form - will refill and resubmit")
+            time.sleep(6)
+
+    if state == "blocked":
+        log(f"[{idx}] blocked after retry")
         sheet_push(row(inbox, user, pwd, "blocked", "imperva post block"))
         return False
 
-    txt = safe_text(page).lower()
-    if "not valid" in txt or "already exists" in txt:
-        log(f"[{idx}] email rejected")
-        sheet_push(row(inbox, user, pwd, "bad_email", ""))
+    if state == "bad_email":
+        log(f"[{idx}] email rejected by pokemon")
+        sheet_push(row(inbox, user, pwd, "bad_email", safe_text(page)[:100]))
         return False
 
-    if not wait_activation(page, 60):
-        log(f"[{idx}] no activation page")
-        snap(page, f"noact_{idx}")
-        sheet_push(row(inbox, user, pwd, "created", "no activation page"))
+    if state in ("still_form", "unknown"):
+        log(f"[{idx}] submit never advanced (state={state})")
+        snap(page, f"submitfail_{idx}")
+        sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
         return False
 
     log(f"[{idx}] activation page reached")
