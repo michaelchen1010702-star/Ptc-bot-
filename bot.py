@@ -21,6 +21,7 @@ import emailer
 # ---------------------------------------------------------------- config
 
 JOIN_URL = "https://join.pokemon.com/"
+API_URL = "https://api.join.pokemon.com/"
 PROFILE_DIR = os.path.expanduser("~/.ptc-profile")
 DEBUG_DIR = "debug"
 os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -67,7 +68,6 @@ AGE_SELECTORS = (
     '[name="month-select"]',
 )
 
-# network observations shared between the response hook and the submit logic
 NET = {"create_user": []}
 
 
@@ -85,7 +85,6 @@ def safe_text(page):
 
 
 def error_text(page):
-    """Text of the first visible validation/error element."""
     for s in (
         '[role="alert"]',
         '.error',
@@ -236,7 +235,6 @@ def goto(page, url, timeout=60000):
 # ---------------------------------------------------------------- step detection
 
 def form_present(page):
-    """Account step: email / username / password."""
     for s in ('#email-field', '[name="email-field"]'):
         try:
             l = page.locator(s).first
@@ -260,7 +258,6 @@ def age_gate_present(page):
 
 
 def page_ready(page):
-    """True as soon as ANY signup step has rendered."""
     return form_present(page) or age_gate_present(page)
 
 
@@ -353,6 +350,17 @@ def type_field(page, name, value, human=True):
     return True
 
 
+def field_value(page, name):
+    for s in (f'#{name}', f'[name="{name}"]'):
+        try:
+            l = page.locator(s).first
+            if l.count():
+                return l.input_value()
+        except Exception:
+            pass
+    return ""
+
+
 def check_label(page, name):
     for s in (f'input[name="{name}"]', f'input[id="{name}"]'):
         try:
@@ -376,7 +384,6 @@ def check_label(page, name):
 
 
 def select_any(page, name, values=(), labels=(), index=None):
-    """Try each candidate value, then each label, then a positional index."""
     for s in (f'[name="{name}"]', f'#{name}'):
         try:
             l = page.locator(s).first
@@ -472,17 +479,27 @@ def recaptcha_info(page):
         return "eval-fail"
 
 
-def ensure_recaptcha(page):
-    info = recaptcha_info(page)
-    log(f"grecaptcha: {info}")
-    if info != "none":
+def ensure_recaptcha(page, patience=25):
+    """Make sure the Enterprise script is present BEFORE the form is filled."""
+    if recaptcha_info(page) != "none":
+        log("grecaptcha: already loaded")
         return True
+
+    log("grecaptcha: missing - injecting enterprise.js")
     try:
         page.add_script_tag(url="https://www.google.com/recaptcha/enterprise.js")
-        time.sleep(3)
-        log(f"grecaptcha after inject: {recaptcha_info(page)}")
     except Exception as e:
         log(f"recaptcha inject fail: {e}")
+        return False
+
+    end = time.time() + patience
+    while time.time() < end:
+        info = recaptcha_info(page)
+        if info != "none":
+            log(f"grecaptcha ready: {info}")
+            return True
+        time.sleep(1)
+    log("grecaptcha: still missing after inject")
     return False
 
 
@@ -538,11 +555,6 @@ def hcaptcha_audio(page):
 
 
 def solve_captcha(page, timeout=20):
-    """Best-effort click of an hCaptcha checkbox.
-
-    Invisible reCAPTCHA Enterprise has no checkbox and no recaptcha-token
-    textarea, so a 'no token' result here is expected - never fatal.
-    """
     end = time.time() + timeout
     clicked = False
     while time.time() < end:
@@ -561,6 +573,31 @@ def solve_captcha(page, timeout=20):
         time.sleep(0.5)
     log(f"captcha: no checkbox (clicked={clicked}) - submitting anyway")
     return token_ready(page)
+
+
+def prewarm_api(page):
+    """api.join.pokemon.com is a separate host with its own Imperva cookies.
+    Visit it in a second tab so the challenge for that host resolves early."""
+    try:
+        cookies = page.context.cookies(API_URL)
+        log(f"api cookies before: {[c['name'] for c in cookies]}")
+    except Exception:
+        pass
+
+    try:
+        p2 = page.context.new_page()
+        p2.goto(API_URL, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(4)
+        log(f"api prewarm text: {safe_text(p2)[:120]}")
+        p2.close()
+    except Exception as e:
+        log(f"api prewarm err: {e}")
+
+    try:
+        cookies = page.context.cookies(API_URL)
+        log(f"api cookies after: {[c['name'] for c in cookies]}")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- submit
@@ -585,20 +622,7 @@ def blocked(page):
     return "apologize for the interruption" in t or "unusual browsing activity" in t
 
 
-def wait_activation(page, timeout=60):
-    end = time.time() + timeout
-    while time.time() < end:
-        t = safe_text(page).lower()
-        if "activation code" in t or "verify your email" in t:
-            return True
-        if blocked(page):
-            return False
-        time.sleep(1)
-    return False
-
-
 def after_submit_state(page, timeout=45):
-    """Watch the page and the create-user response, then name the outcome."""
     end = time.time() + timeout
     while time.time() < end:
         if blocked(page):
@@ -672,6 +696,10 @@ def create_account(page, idx):
         sheet_push(row("", "", "", "nofields", "age gate did not advance"))
         return False
 
+    # get the captcha script in place BEFORE touching the form
+    ensure_recaptcha(page)
+    prewarm_api(page)
+
     try:
         inbox, token = emailer.create_inbox()
     except Exception as e:
@@ -695,17 +723,26 @@ def create_account(page, idx):
             ("password-field", pwd),
         ):
             log(f"  fill {name}: {type_field(page, name, val)}")
+        log(f"  email value read back: {field_value(page, 'email-field')}")
         log(f"  terms: {check_label(page, 'terms')}")
 
-        ensure_recaptcha(page)
-        solve_captcha(page, 20)
+        solve_captcha(page, 15)
 
-        t0 = time.time()
-        submit_form(page)
-        log(f"  submitted in {time.time() - t0:.1f}s")
+        # first POST, then up to 2 fast retries if the edge challenges us
+        for sub in range(1, 4):
+            t0 = time.time()
+            submit_form(page)
+            log(f"  post {sub} sent in {time.time() - t0:.1f}s")
 
-        state = after_submit_state(page, 45)
-        log(f"  after submit: {state} | url={page.url}")
+            state = after_submit_state(page, 30)
+            log(f"  after post {sub}: {state} | url={page.url}")
+
+            if state != "rate_limited":
+                break
+
+            log(f"  429 on post {sub} - retrying in 10s")
+            time.sleep(10)
+
         log(f"  page text: {safe_text(page)[:600]}")
         log(f"  error text: {error_text(page)[:180]}")
         snap(page, f"after{attempt}_{idx}")
@@ -714,9 +751,14 @@ def create_account(page, idx):
             break
 
         if state == "rate_limited":
-            wait = 30 * attempt
-            log(f"[{idx}] create-user 429 - cooling {wait}s")
+            wait = 45 * attempt
+            log(f"[{idx}] still 429 - cooling {wait}s and clearing cookies")
             time.sleep(wait)
+            try:
+                page.context.clear_cookies()
+                log("  cookies cleared")
+            except Exception:
+                pass
             goto(page, JOIN_URL)
             wait_for_ready(page, 45)
             if not form_present(page):
@@ -725,6 +767,7 @@ def create_account(page, idx):
             if not form_present(page):
                 log(f"[{idx}] form lost after cooldown")
                 break
+            ensure_recaptcha(page)
             continue
 
         if state == "blocked":
@@ -790,35 +833,48 @@ def create_account(page, idx):
 
 # ---------------------------------------------------------------- main
 
+def launch(pw):
+    ctx = pw.chromium.launch_persistent_context(
+        user_data_dir=PROFILE_DIR,
+        channel="chrome",
+        headless=HEADLESS,
+        ignore_default_args=["--enable-automation"],
+        args=CHROME_ARGS,
+        locale="en-US",
+        timezone_id="America/Los_Angeles",
+        viewport={"width": 1440, "height": 900},
+        user_agent=UA,
+    )
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    hook_diag(page)
+    return ctx, page
+
+
 def main():
     log(f"count={COUNT} headless={HEADLESS}")
     ok = 0
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=PROFILE_DIR,
-            channel="chrome",
-            headless=HEADLESS,
-            ignore_default_args=["--enable-automation"],
-            args=CHROME_ARGS,
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
-            viewport={"width": 1440, "height": 900},
-            user_agent=UA,
-        )
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        hook_diag(page)
 
-        for i in range(1, COUNT + 1):
-            try:
-                if create_account(page, i):
-                    ok += 1
-            except Exception as e:
-                log(f"[{i}] exception: {e}")
-                traceback.print_exc()
-                snap(page, f"exc_{i}")
-            time.sleep(2)
+    for rnd in (1, 2):
+        if ok >= COUNT:
+            break
+        log(f"=== round {rnd} ===")
 
-        ctx.close()
+        with sync_playwright() as pw:
+            ctx, page = launch(pw)
+            for i in range(1, COUNT + 1):
+                try:
+                    if create_account(page, i):
+                        ok += 1
+                except Exception as e:
+                    log(f"[{i}] exception: {e}")
+                    traceback.print_exc()
+                    snap(page, f"exc_{i}")
+                time.sleep(2)
+            ctx.close()
+
+        if ok == 0 and rnd == 1:
+            log("no accounts - cooling 90s then a fresh browser round")
+            time.sleep(90)
 
     log(f"done: {ok}/{COUNT} accounts created")
     sys.exit(0 if ok else 1)
