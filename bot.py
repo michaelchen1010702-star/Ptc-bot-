@@ -201,6 +201,13 @@ def hook_diag(page):
                 pass
             NET["create_user"].append({"status": resp.status, "body": body})
             log(f"[resp {resp.status}] create-user body={body}")
+        elif "start-activation" in u:
+            body = ""
+            try:
+                body = (resp.text() or "")[:300]
+            except Exception:
+                pass
+            log(f"[resp {resp.status}] start-activation body={body}")
         elif "api.join.pokemon.com" in u:
             log(f"[resp {resp.status}] api {u[:110]}")
         elif "_Incapsula" in u or "recaptcha" in u or "hcaptcha" in u:
@@ -593,7 +600,7 @@ def fill_activation(page, code):
     return False
 
 
-def read_code_from_mail(inbox, token, page=None, timeout=300):
+def read_code_from_mail(inbox, token, page=None, timeout=150):
     end = time.time() + timeout
     poll = 0
     resent = False
@@ -621,13 +628,13 @@ def read_code_from_mail(inbox, token, page=None, timeout=300):
             if code:
                 return code
 
-        if not resent and page is not None and poll >= 15:
-            log("  no mail after ~90s - clicking resend")
+        if not resent and page is not None and poll >= 10:
+            log("  no mail yet - clicking resend")
             if click_text(page, "Resend Activation Code", timeout=5000):
                 log("  resend clicked")
             resent = True
 
-        time.sleep(6)
+        time.sleep(8)
     return None
 
 
@@ -668,7 +675,6 @@ def create_account(page, idx):
     tried = []
 
     for attempt in range(1, 9):
-        # fresh page every attempt so no stale validation state survives
         if attempt > 1:
             if not back_to_form(page):
                 log(f"[{idx}] lost the form")
@@ -714,7 +720,10 @@ def create_account(page, idx):
 
         resp = NET["create_user"][-1]
         state = classify(resp)
-        log(f"  state: {state} status={resp.get('status')} body={(resp.get('body') or '')[:160]}")
+        log(
+            f"  state: {state} status={resp.get('status')} "
+            f"body={(resp.get('body') or '')[:160]}"
+        )
         snap(page, f"a{attempt}_{idx}")
 
         if state == "activation":
@@ -760,7 +769,7 @@ def create_account(page, idx):
         return "submit_failed"
 
     log(f"[{idx}] account exists as {user}")
-    code = read_code_from_mail(inbox, token, page, 300)
+    code = read_code_from_mail(inbox, token, page, 150)
     log(f"[{idx}] activation code: {code}")
     if not code:
         snap(page, f"nocode_{idx}")
