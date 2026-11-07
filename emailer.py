@@ -2,6 +2,7 @@
 """Throwaway inbox helpers.
 
 Domain pool spans tempmail.lol and mail.tm so we can rotate.
+Domains without an MX record are dropped - they cannot receive mail.
 """
 
 import os
@@ -40,7 +41,7 @@ SEED_DOMAINS = [
 
 DOMAIN_POOL = []
 _pool_idx = 0
-LAST_STATUS = 0
+LAST_INFO = {}
 
 
 def _get(url, **kw):
@@ -53,6 +54,22 @@ def _post(url, **kw):
     kw.setdefault("timeout", 25)
     kw.setdefault("headers", {"User-Agent": UA, "Accept": "application/json"})
     return requests.post(url, **kw)
+
+
+# ---------------------------------------------------------------- dns
+
+def has_mx(domain):
+    """True/False, or None if the lookup itself failed."""
+    try:
+        r = _get(
+            "https://dns.google/resolve",
+            params={"name": domain, "type": "MX"},
+        )
+        if not r.ok:
+            return None
+        return bool(r.json().get("Answer"))
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- domain pool
@@ -97,11 +114,9 @@ def sample_mailtm_domains(host="api.mail.tm", n=10):
 
 
 def prime_domains():
-    """Build the rotation pool. Domains proven to reach Pokemon go first."""
     global DOMAIN_POOL, _pool_idx
     pool = []
 
-    # proven-good tempmail.lol domains first
     for d in ("marchslurp.com", "arcadehearth.com"):
         pool.append({"domain": d, "provider": "tempmail"})
 
@@ -117,9 +132,17 @@ def prime_domains():
         if not any(p["domain"] == d for p in pool):
             pool.append({"domain": d, "provider": "tempmail"})
 
-    DOMAIN_POOL = pool
+    kept = []
+    for p in pool:
+        mx = has_mx(p["domain"])
+        print(f"[emailer] mx {p['domain']}: {mx}", flush=True)
+        if mx is False:
+            continue
+        kept.append(p)
+
+    DOMAIN_POOL = kept or pool
     _pool_idx = 0
-    print(f"[emailer] domain pool: {[p['domain'] for p in pool]}", flush=True)
+    print(f"[emailer] domain pool: {[p['domain'] for p in DOMAIN_POOL]}", flush=True)
     return DOMAIN_POOL
 
 
@@ -156,15 +179,19 @@ def _tempmail_v1():
 
 
 def _tempmail_fetch(token):
-    global LAST_STATUS
-    LAST_STATUS = 0
+    global LAST_INFO
+    LAST_INFO = {"status": 0, "expired": None, "n": 0}
 
     try:
         r = _get("https://api.tempmail.lol/v2/inbox?token=" + quote(token or "", safe=""))
-        LAST_STATUS = r.status_code
+        LAST_INFO["status"] = r.status_code
         if r.ok:
+            j = r.json()
+            emails = j.get("emails", []) or []
+            LAST_INFO["expired"] = j.get("expired")
+            LAST_INFO["n"] = len(emails)
             out = []
-            for e in r.json().get("emails", []) or []:
+            for e in emails:
                 out.append(
                     {
                         "subject": e.get("subject", "") or "",
@@ -174,8 +201,9 @@ def _tempmail_fetch(token):
                 )
             if out:
                 return out
-    except Exception:
-        pass
+            return []
+    except Exception as e:
+        LAST_INFO["err"] = str(e)[:80]
 
     try:
         r = _get("https://api.tempmail.lol/auth/" + quote(token or "", safe=""))
@@ -215,17 +243,18 @@ def _mailtm_create(host, domain=None):
 
 
 def _mailtm_fetch(host, token):
-    global LAST_STATUS
+    global LAST_INFO
     try:
         r = _get(
             f"https://{host}/messages",
             headers={"Authorization": "Bearer " + token, "User-Agent": UA},
         )
-        LAST_STATUS = r.status_code
+        LAST_INFO = {"status": r.status_code, "n": 0}
         if not r.ok:
             return []
         msgs = r.json()
         msgs = msgs.get("hydra:member", msgs) if isinstance(msgs, dict) else msgs
+        LAST_INFO["n"] = len(msgs)
         out = []
         for m in msgs:
             full = _get(
