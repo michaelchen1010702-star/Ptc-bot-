@@ -30,6 +30,8 @@ UA = (
 TEMPMAIL_CREATE = "https://api.tempmail.lol/v2/inbox/create"
 
 SEED_DOMAINS = [
+    "marchslurp.com",
+    "arcadehearth.com",
     "lucktaro.com",
     "xzcoot.com",
     "paxeluni.com",
@@ -38,6 +40,7 @@ SEED_DOMAINS = [
 
 DOMAIN_POOL = []
 _pool_idx = 0
+LAST_STATUS = 0
 
 
 def _get(url, **kw):
@@ -59,7 +62,7 @@ def _base_domain(host):
     return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
 
-def sample_pool(n=6):
+def sample_pool(n=3):
     bases = []
     for _ in range(n):
         try:
@@ -94,11 +97,17 @@ def sample_mailtm_domains(host="api.mail.tm", n=10):
 
 
 def prime_domains():
+    """Build the rotation pool. Domains proven to reach Pokemon go first."""
     global DOMAIN_POOL, _pool_idx
     pool = []
 
-    for d in sample_pool(6):
+    # proven-good tempmail.lol domains first
+    for d in ("marchslurp.com", "arcadehearth.com"):
         pool.append({"domain": d, "provider": "tempmail"})
+
+    for d in sample_pool(3):
+        if not any(p["domain"] == d for p in pool):
+            pool.append({"domain": d, "provider": "tempmail"})
 
     for d in sample_mailtm_domains("api.mail.tm", 10):
         if not any(p["domain"] == d for p in pool):
@@ -147,8 +156,12 @@ def _tempmail_v1():
 
 
 def _tempmail_fetch(token):
+    global LAST_STATUS
+    LAST_STATUS = 0
+
     try:
         r = _get("https://api.tempmail.lol/v2/inbox?token=" + quote(token or "", safe=""))
+        LAST_STATUS = r.status_code
         if r.ok:
             out = []
             for e in r.json().get("emails", []) or []:
@@ -202,11 +215,13 @@ def _mailtm_create(host, domain=None):
 
 
 def _mailtm_fetch(host, token):
+    global LAST_STATUS
     try:
         r = _get(
             f"https://{host}/messages",
             headers={"Authorization": "Bearer " + token, "User-Agent": UA},
         )
+        LAST_STATUS = r.status_code
         if not r.ok:
             return []
         msgs = r.json()
