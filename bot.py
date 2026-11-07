@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Pokemon Trainer Club account creator.
 
-join.pokemon.com 4-step wizard -> Imperva/Incapsula challenge -> captcha ->
-submit -> emailed 6-digit activation code -> Google Sheet row.
+join.pokemon.com 4-step wizard -> Imperva/Incapsula challenge -> submit ->
+emailed 6-digit activation code -> Google Sheet row.
 """
 
 import os
@@ -475,17 +475,6 @@ def do_age_gate(page):
 
 # ---------------------------------------------------------------- captcha
 
-def token_ready(page):
-    for s in ('#recaptcha-token', '[name="g-recaptcha-response"]', '[name="h-captcha-response"]'):
-        try:
-            v = page.eval_on_selector(s, "el => el.value")
-            if v:
-                return True
-        except Exception:
-            pass
-    return False
-
-
 def recaptcha_info(page):
     try:
         return page.evaluate(
@@ -517,78 +506,6 @@ def ensure_recaptcha(page, patience=25):
         time.sleep(1)
     log("grecaptcha: still missing after inject")
     return False
-
-
-def hcaptcha_audio(page):
-    try:
-        import speech_recognition as sr
-    except Exception:
-        return False
-
-    for fr in page.frames:
-        if "hcaptcha" not in fr.url:
-            continue
-        try:
-            btn = fr.locator('#audio-button, button[title*="audio" i], .audio-button').first
-            if btn.count():
-                btn.click()
-                time.sleep(2)
-
-            src = None
-            for s in ("#audio-source", "audio"):
-                try:
-                    el = fr.locator(s).first
-                    if el.count():
-                        src = el.get_attribute("src")
-                        if src:
-                            break
-                except Exception:
-                    pass
-            if not src:
-                continue
-
-            data = requests.get(src, timeout=30).content
-            with open(os.path.join(DEBUG_DIR, "hc.mp3"), "wb") as f:
-                f.write(data)
-
-            rec = sr.Recognizer()
-            with sr.AudioFile(os.path.join(DEBUG_DIR, "hc.mp3")) as srcf:
-                audio = rec.record(srcf)
-            text = rec.recognize_google(audio)
-            log(f"captcha: audio -> {text}")
-
-            box = fr.locator('#audio-response, [name="audio-response"]').first
-            box.click()
-            fr.page.keyboard.type(text.lower())
-            sub = fr.locator("#audio-submit, .audio-submit").first
-            if sub.count():
-                sub.click()
-            time.sleep(3)
-            return True
-        except Exception as e:
-            log(f"captcha audio err: {e}")
-    return False
-
-
-def solve_captcha(page, timeout=20):
-    end = time.time() + timeout
-    clicked = False
-    while time.time() < end:
-        for fr in page.frames:
-            if not any(k in fr.url for k in ("hcaptcha", "recaptcha", "hcap")):
-                continue
-            if not clicked:
-                try:
-                    box = fr.locator("#checkbox, .checkbox").first
-                    if box.count() and box.is_visible():
-                        box.click()
-                        clicked = True
-                        log("captcha: clicked checkbox")
-                except Exception:
-                    pass
-        time.sleep(0.5)
-    log(f"captcha: no checkbox (clicked={clicked}) - submitting anyway")
-    return token_ready(page)
 
 
 def prewarm_api(page):
@@ -683,33 +600,56 @@ def fill_activation(page, code):
     return False
 
 
-def read_code_from_mail(inbox, token, timeout=240):
+def read_code_from_mail(inbox, token, page=None, timeout=300):
     end = time.time() + timeout
+    poll = 0
+    resent = False
     while time.time() < end:
+        poll += 1
         try:
             msgs = emailer.fetch_messages(inbox, token)
         except Exception as e:
-            log(f"mail fetch err: {e}")
+            log(f"  mail fetch err: {e}")
             msgs = []
+
+        log(f"  poll {poll}: status={emailer.LAST_STATUS} msgs={len(msgs)}")
+
         for m in msgs:
-            blob = (m.get("subject", "") + " " + m.get("body", "") + " " + m.get("html", ""))
+            subj = (m.get("subject", "") or "")[:70]
+            log(f"    mail: {subj}")
+            blob = (
+                (m.get("subject", "") or "")
+                + " "
+                + (m.get("body", "") or "")
+                + " "
+                + (m.get("html", "") or "")
+            )
             code = extract_code(blob)
             if code:
                 return code
-        time.sleep(5)
+
+        if not resent and page is not None and poll >= 15:
+            log("  no mail after ~90s - clicking resend")
+            if click_text(page, "Resend Activation Code", timeout=5000):
+                log("  resend clicked")
+            resent = True
+
+        time.sleep(6)
     return None
 
 
 # ---------------------------------------------------------------- one account
 
 def create_account(page, idx):
+    """Returns a status string: ok, created, bad_email, blocked, rate_limited,
+    submit_failed, blank, nofields, error."""
     log(f"[{idx}] --- start ---")
 
     if not get_ready(page):
         log(f"[{idx}] page never rendered (imperva challenge)")
         snap(page, f"blank_{idx}")
         sheet_push(row("", "", "", "blank", "imperva challenge loop"))
-        return False
+        return "blank"
 
     if not form_present(page):
         do_age_gate(page)
@@ -722,7 +662,7 @@ def create_account(page, idx):
         log(f"[{idx}] account form never appeared")
         snap(page, f"nofields_{idx}")
         sheet_push(row("", "", "", "nofields", "age gate did not advance"))
-        return False
+        return "nofields"
 
     ensure_recaptcha(page)
     prewarm_api(page)
@@ -755,8 +695,6 @@ def create_account(page, idx):
             log(f"  fill {name}: {type_field(page, name, val)}")
         log(f"  email value read back: {field_value(page, 'email-field')}")
         log(f"  terms: {check_label(page, 'terms')}")
-
-        solve_captcha(page, 12)
 
         for sub in range(1, 3):
             submit_form(page)
@@ -808,32 +746,33 @@ def create_account(page, idx):
 
     if not inbox:
         sheet_push(row("", "", "", "error", "no inbox"))
-        return False
+        return "error"
 
     if state == "rate_limited":
         sheet_push(row(inbox, user, pwd, "rate_limited", f"domains={','.join(tried)}"))
-        return False
+        return "rate_limited"
 
     if state == "blocked":
         sheet_push(row(inbox, user, pwd, "blocked", f"domains={','.join(tried)}"))
-        return False
+        return "blocked"
 
     if state == "bad_email":
         log(f"[{idx}] all domains rejected: {tried}")
         sheet_push(row(inbox, user, pwd, "bad_email", f"domains={','.join(tried)}"))
-        return False
+        return "bad_email"
 
     if state != "activation":
         snap(page, f"submitfail_{idx}")
         sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
-        return False
+        return "submit_failed"
 
-    log(f"[{idx}] activation page reached")
-    code = read_code_from_mail(inbox, token, 240)
+    log(f"[{idx}] activation page reached - account exists as {user}")
+    code = read_code_from_mail(inbox, token, page, 300)
     log(f"[{idx}] activation code: {code}")
     if not code:
-        sheet_push(row(inbox, user, pwd, "created", "no code in mail"))
-        return False
+        snap(page, f"nocode_{idx}")
+        sheet_push(row(inbox, user, pwd, "created", f"no code | dom={got_dom}"))
+        return "created"
 
     fill_activation(page, code)
     time.sleep(4)
@@ -841,12 +780,12 @@ def create_account(page, idx):
     if "thank you" in t or "activated" in t:
         log(f"[{idx}] -> {user} [ok]")
         sheet_push(row(inbox, user, pwd, "ok", ""))
-        return True
+        return "ok"
 
     log(f"[{idx}] code rejected")
     snap(page, f"coderej_{idx}")
     sheet_push(row(inbox, user, pwd, "created", "code rejected"))
-    return False
+    return "created"
 
 
 # ---------------------------------------------------------------- main
@@ -873,6 +812,7 @@ def main():
     emailer.prime_domains()
 
     ok = 0
+    partial = 0
 
     for rnd in (1, 2):
         if ok >= COUNT:
@@ -883,8 +823,11 @@ def main():
             ctx, page = launch(pw)
             for i in range(1, COUNT + 1):
                 try:
-                    if create_account(page, i):
+                    st = create_account(page, i)
+                    if st == "ok":
                         ok += 1
+                    elif st == "created":
+                        partial += 1
                 except Exception as e:
                     log(f"[{i}] exception: {e}")
                     traceback.print_exc()
@@ -892,12 +835,12 @@ def main():
                 time.sleep(2)
             ctx.close()
 
-        if ok == 0 and rnd == 1:
-            log("no accounts - cooling 90s then a fresh browser round")
+        if ok == 0 and partial == 0 and rnd == 1:
+            log("nothing created - cooling 90s then a fresh browser round")
             time.sleep(90)
 
-    log(f"done: {ok}/{COUNT} accounts created")
-    sys.exit(0 if ok else 1)
+    log(f"done: ok={ok} created={partial} of {COUNT}")
+    sys.exit(0 if (ok or partial) else 1)
 
 
 if __name__ == "__main__":
