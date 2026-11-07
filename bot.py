@@ -84,25 +84,6 @@ def safe_text(page):
         return ""
 
 
-def error_text(page):
-    for s in (
-        '[role="alert"]',
-        '.error',
-        '.error-message',
-        '[class*="error" i]',
-        '[class*="invalid" i]',
-    ):
-        try:
-            l = page.locator(s).first
-            if l.count() and l.is_visible():
-                t = (l.inner_text() or "").strip()
-                if t:
-                    return re.sub(r"\s+", " ", t)[:200]
-        except Exception:
-            pass
-    return ""
-
-
 def snap(page, tag):
     try:
         page.screenshot(path=os.path.join(DEBUG_DIR, f"{tag}.png"), full_page=True)
@@ -213,12 +194,12 @@ def hook_diag(page):
     def on_response(resp):
         u = resp.url
         if "create-user" in u:
-            NET["create_user"].append(resp.status)
             body = ""
             try:
                 body = (resp.text() or "")[:400]
             except Exception:
                 pass
+            NET["create_user"].append({"status": resp.status, "body": body})
             log(f"[resp {resp.status}] create-user body={body}")
         elif "api.join.pokemon.com" in u:
             log(f"[resp {resp.status}] api {u[:110]}")
@@ -553,35 +534,47 @@ def blocked(page):
     return "apologize for the interruption" in t or "unusual browsing activity" in t
 
 
-def after_submit_state(page, timeout=45):
+def submit_and_wait(page, timeout=25):
+    """Click submit and wait for an actual create-user response."""
+    before = len(NET["create_user"])
+    submit_form(page)
     end = time.time() + timeout
     while time.time() < end:
+        if len(NET["create_user"]) > before:
+            return "posted"
         if blocked(page):
             return "blocked"
-        if NET["create_user"] and NET["create_user"][-1] == 429:
-            return "rate_limited"
         t = safe_text(page).lower()
         if "activation code" in t or "verify your email" in t:
             return "activation"
-        e = error_text(page).lower()
-        if "already exists" in e or "not valid" in e:
-            return "bad_email"
         time.sleep(1)
-    return "still_form" if form_present(page) else "unknown"
+    return "no_post"
+
+
+def classify(resp):
+    status = resp.get("status", 0)
+    body = (resp.get("body") or "").lower()
+    if status == 200 and "guid" in body:
+        return "activation"
+    if "invalid" in body or "exists" in body:
+        return "bad_email"
+    if status == 429:
+        return "rate_limited"
+    return "unknown"
 
 
 def back_to_form(page):
-    click_text(page, "Use a Different Email", timeout=5000)
-    if wait_for_ready(page, 20) and form_present(page):
-        return True
-
+    """Always a full reload so no stale error state survives."""
     goto(page, JOIN_URL)
     if not wait_for_ready(page, 45):
         return False
     if not form_present(page):
         do_age_gate(page)
         wait_for_ready(page, 30)
-    return form_present(page)
+    if form_present(page):
+        ensure_recaptcha(page)
+        return True
+    return False
 
 
 def fill_activation(page, code):
@@ -641,7 +634,7 @@ def read_code_from_mail(inbox, token, page=None, timeout=300):
 # ---------------------------------------------------------------- one account
 
 def create_account(page, idx):
-    """Returns a status string: ok, created, bad_email, blocked, rate_limited,
+    """Returns: ok, created, bad_email, blocked, rate_limited, no_post,
     submit_failed, blank, nofields, error."""
     log(f"[{idx}] --- start ---")
 
@@ -675,6 +668,12 @@ def create_account(page, idx):
     tried = []
 
     for attempt in range(1, 9):
+        # fresh page every attempt so no stale validation state survives
+        if attempt > 1:
+            if not back_to_form(page):
+                log(f"[{idx}] lost the form")
+                break
+
         entry = emailer.next_domain()
         try:
             inbox, token = emailer.create_inbox(entry)
@@ -685,7 +684,6 @@ def create_account(page, idx):
         got_dom = inbox.split("@", 1)[1]
         tried.append(got_dom)
         log(f"[{idx}] attempt {attempt} email={inbox} user={user}")
-        NET["create_user"] = []
 
         for name, val in (
             ("email-field", inbox),
@@ -693,60 +691,54 @@ def create_account(page, idx):
             ("password-field", pwd),
         ):
             log(f"  fill {name}: {type_field(page, name, val)}")
-        log(f"  email value read back: {field_value(page, 'email-field')}")
         log(f"  terms: {check_label(page, 'terms')}")
 
-        for sub in range(1, 3):
-            submit_form(page)
-            state = after_submit_state(page, 30)
-            log(f"  after post {sub}: {state} | url={page.url}")
-            if state != "rate_limited":
-                break
-            log(f"  429 on post {sub} - retrying in 10s")
-            time.sleep(10)
+        outcome = submit_and_wait(page, 25)
+        log(f"  outcome: {outcome}")
 
-        log(f"  error text: {error_text(page)[:180]}")
+        if outcome == "blocked":
+            state = "blocked"
+            log(f"[{idx}] imperva block - cooling 25s")
+            time.sleep(25)
+            continue
+
+        if outcome == "activation":
+            state = "activation"
+            break
+
+        if outcome == "no_post":
+            state = "no_post"
+            log(f"[{idx}] no POST fired - reloading")
+            time.sleep(6)
+            continue
+
+        resp = NET["create_user"][-1]
+        state = classify(resp)
+        log(f"  state: {state} status={resp.get('status')} body={(resp.get('body') or '')[:160]}")
         snap(page, f"a{attempt}_{idx}")
 
         if state == "activation":
             break
-
         if state == "bad_email":
-            log(f"[{idx}] {got_dom} rejected - next domain")
-            if form_present(page):
-                type_field(page, "email-field", "", human=False)
-                time.sleep(1)
-            elif not back_to_form(page):
-                log(f"[{idx}] lost the form")
-                break
+            log(f"[{idx}] {got_dom} rejected")
+            time.sleep(8)
             continue
-
         if state == "rate_limited":
-            wait = 30 * attempt
-            log(f"[{idx}] still 429 - cooling {wait}s")
-            time.sleep(wait)
-            if not back_to_form(page):
-                break
-            ensure_recaptcha(page)
+            log(f"[{idx}] rate limited - cooling 30s")
+            time.sleep(30)
             continue
 
-        if state == "blocked":
-            log(f"[{idx}] imperva block - cooling 25s")
-            time.sleep(25)
-            if not back_to_form(page):
-                break
-            continue
-
-        if state == "still_form":
-            log(f"[{idx}] still on form - refilling")
-            time.sleep(5)
-            continue
-
-        break
+        log(f"[{idx}] unknown outcome - cooling 10s")
+        time.sleep(10)
 
     if not inbox:
         sheet_push(row("", "", "", "error", "no inbox"))
         return "error"
+
+    if state == "bad_email":
+        log(f"[{idx}] all domains rejected: {tried}")
+        sheet_push(row(inbox, user, pwd, "bad_email", f"domains={','.join(tried)}"))
+        return "bad_email"
 
     if state == "rate_limited":
         sheet_push(row(inbox, user, pwd, "rate_limited", f"domains={','.join(tried)}"))
@@ -756,17 +748,18 @@ def create_account(page, idx):
         sheet_push(row(inbox, user, pwd, "blocked", f"domains={','.join(tried)}"))
         return "blocked"
 
-    if state == "bad_email":
-        log(f"[{idx}] all domains rejected: {tried}")
-        sheet_push(row(inbox, user, pwd, "bad_email", f"domains={','.join(tried)}"))
-        return "bad_email"
+    if state in ("no_post", "unknown"):
+        log(f"[{idx}] submit never produced a result ({state})")
+        snap(page, f"submitfail_{idx}")
+        sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
+        return "submit_failed"
 
     if state != "activation":
         snap(page, f"submitfail_{idx}")
         sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
         return "submit_failed"
 
-    log(f"[{idx}] activation page reached - account exists as {user}")
+    log(f"[{idx}] account exists as {user}")
     code = read_code_from_mail(inbox, token, page, 300)
     log(f"[{idx}] activation code: {code}")
     if not code:
