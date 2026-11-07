@@ -612,7 +612,7 @@ def read_code_from_mail(inbox, token, page=None, timeout=300):
             log(f"  mail fetch err: {e}")
             msgs = []
 
-        log(f"  poll {poll}: status={emailer.LAST_STATUS} msgs={len(msgs)}")
+        log(f"  poll {poll}: {emailer.LAST_INFO} got={len(msgs)}")
 
         for m in msgs:
             subj = (m.get("subject", "") or "")[:70]
