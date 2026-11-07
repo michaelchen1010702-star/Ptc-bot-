@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Throwaway inbox helpers.
 
-Domain pool spans tempmail.lol and mail.tm so we can rotate.
+Domain pool interleaves mail.tm and tempmail.lol so both get real tests.
 Domains without an MX record are dropped - they cannot receive mail.
 """
 
@@ -115,22 +115,27 @@ def sample_mailtm_domains(host="api.mail.tm", n=10):
 
 def prime_domains():
     global DOMAIN_POOL, _pool_idx
-    pool = []
 
+    tm = []
     for d in ("marchslurp.com", "arcadehearth.com"):
-        pool.append({"domain": d, "provider": "tempmail"})
-
+        tm.append({"domain": d, "provider": "tempmail"})
     for d in sample_pool(3):
-        if not any(p["domain"] == d for p in pool):
-            pool.append({"domain": d, "provider": "tempmail"})
-
-    for d in sample_mailtm_domains("api.mail.tm", 10):
-        if not any(p["domain"] == d for p in pool):
-            pool.append({"domain": d, "provider": "mailtm"})
-
+        if not any(p["domain"] == d for p in tm):
+            tm.append({"domain": d, "provider": "tempmail"})
     for d in SEED_DOMAINS:
-        if not any(p["domain"] == d for p in pool):
-            pool.append({"domain": d, "provider": "tempmail"})
+        if not any(p["domain"] == d for p in tm):
+            tm.append({"domain": d, "provider": "tempmail"})
+
+    mt = []
+    for d in sample_mailtm_domains("api.mail.tm", 10):
+        mt.append({"domain": d, "provider": "mailtm"})
+
+    pool = []
+    for i in range(max(len(tm), len(mt))):
+        if i < len(mt):
+            pool.append(mt[i])
+        if i < len(tm):
+            pool.append(tm[i])
 
     kept = []
     for p in pool:
