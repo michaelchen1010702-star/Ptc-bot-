@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Throwaway inbox helpers.
 
-Domain pool interleaves mail.tm and tempmail.lol so both get real tests.
-Domains without an MX record are dropped - they cannot receive mail.
+Domain pool interleaves mail.tm / mail.gw / tempmail.lol.
+Domains without an MX record are dropped.
 """
 
 import os
@@ -59,12 +59,8 @@ def _post(url, **kw):
 # ---------------------------------------------------------------- dns
 
 def has_mx(domain):
-    """True/False, or None if the lookup itself failed."""
     try:
-        r = _get(
-            "https://dns.google/resolve",
-            params={"name": domain, "type": "MX"},
-        )
+        r = _get("https://dns.google/resolve", params={"name": domain, "type": "MX"})
         if not r.ok:
             return None
         return bool(r.json().get("Answer"))
@@ -96,10 +92,11 @@ def sample_pool(n=3):
     return bases
 
 
-def sample_mailtm_domains(host="api.mail.tm", n=10):
+def sample_mailtm_domains(host, n=6):
     try:
         r = _get(f"https://{host}/domains")
         if not r.ok:
+            print(f"[emailer] {host} domains: {r.status_code}", flush=True)
             return []
         j = r.json()
         doms = j.get("hydra:member", j) if isinstance(j, dict) else j
@@ -109,7 +106,8 @@ def sample_mailtm_domains(host="api.mail.tm", n=10):
             if dom:
                 out.append(dom)
         return out
-    except Exception:
+    except Exception as e:
+        print(f"[emailer] {host} domains err: {str(e)[:60]}", flush=True)
         return []
 
 
@@ -127,8 +125,9 @@ def prime_domains():
             tm.append({"domain": d, "provider": "tempmail"})
 
     mt = []
-    for d in sample_mailtm_domains("api.mail.tm", 10):
-        mt.append({"domain": d, "provider": "mailtm"})
+    for host in ("api.mail.tm", "api.mail.gw"):
+        for d in sample_mailtm_domains(host, 6):
+            mt.append({"domain": d, "provider": "mailtm", "host": host})
 
     pool = []
     for i in range(max(len(tm), len(mt))):
@@ -138,7 +137,11 @@ def prime_domains():
             pool.append(tm[i])
 
     kept = []
+    seen = set()
     for p in pool:
+        if p["domain"] in seen:
+            continue
+        seen.add(p["domain"])
         mx = has_mx(p["domain"])
         print(f"[emailer] mx {p['domain']}: {mx}", flush=True)
         if mx is False:
@@ -185,18 +188,16 @@ def _tempmail_v1():
 
 def _tempmail_fetch(token):
     global LAST_INFO
-    LAST_INFO = {"status": 0, "expired": None, "n": 0}
+    LAST_INFO = {"status": 0, "v1": 0, "expired": None, "n": 0}
+    out = []
 
     try:
         r = _get("https://api.tempmail.lol/v2/inbox?token=" + quote(token or "", safe=""))
         LAST_INFO["status"] = r.status_code
         if r.ok:
             j = r.json()
-            emails = j.get("emails", []) or []
             LAST_INFO["expired"] = j.get("expired")
-            LAST_INFO["n"] = len(emails)
-            out = []
-            for e in emails:
+            for e in j.get("emails", []) or []:
                 out.append(
                     {
                         "subject": e.get("subject", "") or "",
@@ -204,26 +205,27 @@ def _tempmail_fetch(token):
                         "html": e.get("html", "") or "",
                     }
                 )
-            if out:
-                return out
-            return []
     except Exception as e:
-        LAST_INFO["err"] = str(e)[:80]
+        LAST_INFO["err"] = str(e)[:60]
 
-    try:
-        r = _get("https://api.tempmail.lol/auth/" + quote(token or "", safe=""))
-        if r.ok:
-            return [
-                {
-                    "subject": e.get("subject", "") or "",
-                    "body": e.get("body", "") or "",
-                    "html": e.get("html", "") or "",
-                }
-                for e in r.json().get("email", []) or []
-            ]
-    except Exception:
-        pass
-    return []
+    if not out:
+        try:
+            r = _get("https://api.tempmail.lol/auth/" + quote(token or "", safe=""))
+            LAST_INFO["v1"] = r.status_code
+            if r.ok:
+                for e in r.json().get("email", []) or []:
+                    out.append(
+                        {
+                            "subject": e.get("subject", "") or "",
+                            "body": e.get("body", "") or "",
+                            "html": e.get("html", "") or "",
+                        }
+                    )
+        except Exception:
+            pass
+
+    LAST_INFO["n"] = len(out)
+    return out
 
 
 # ---------------------------------------------------------------- mail.tm / gw
@@ -281,12 +283,13 @@ def _mailtm_fetch(host, token):
 # ---------------------------------------------------------------- public API
 
 def create_inbox(entry=None):
-    """entry is a dict from next_domain(), a domain string, or None."""
     dom = None
     prov = "tempmail"
+    host = "api.mail.tm"
     if isinstance(entry, dict):
         dom = entry.get("domain")
         prov = entry.get("provider", "tempmail")
+        host = entry.get("host") or "api.mail.tm"
     elif isinstance(entry, str):
         dom = entry
 
@@ -295,7 +298,7 @@ def create_inbox(entry=None):
     if dom:
         if prov == "mailtm":
             try:
-                return _mailtm_create("api.mail.tm", dom)
+                return _mailtm_create(host, dom)
             except Exception as e:
                 errors.append(f"mailtm[{dom}]: {e}")
         else:
@@ -318,11 +321,11 @@ def create_inbox(entry=None):
     except Exception as e:
         errors.append(f"v1: {e}")
 
-    for host in ("api.mail.tm", "api.mail.gw"):
+    for h in ("api.mail.tm", "api.mail.gw"):
         try:
-            return _mailtm_create(host)
+            return _mailtm_create(h)
         except Exception as e:
-            errors.append(f"{host}: {e}")
+            errors.append(f"{h}: {e}")
 
     raise RuntimeError("no inbox available | " + " ; ".join(errors[-6:]))
 
