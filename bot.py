@@ -68,7 +68,7 @@ AGE_SELECTORS = (
     '[name="month-select"]',
 )
 
-NET = {"create_user": []}
+NET = {"create_user": [], "validate": []}
 
 
 # ---------------------------------------------------------------- utils
@@ -201,6 +201,14 @@ def hook_diag(page):
                 pass
             NET["create_user"].append({"status": resp.status, "body": body})
             log(f"[resp {resp.status}] create-user body={body}")
+        elif "validate-user-fields" in u:
+            body = ""
+            try:
+                body = (resp.text() or "")[:300]
+            except Exception:
+                pass
+            NET["validate"].append({"status": resp.status, "body": body})
+            log(f"[resp {resp.status}] validate body={body}")
         elif "start-activation" in u:
             body = ""
             try:
@@ -713,8 +721,16 @@ def create_account(page, idx):
             break
 
         if outcome == "no_post":
+            v = (NET["validate"] or [{}])[-1]
+            vbody = (v.get("body") or "").lower()
+            log(f"  validate body: {vbody[:160]}")
+            if "invalid" in vbody or "exists" in vbody:
+                state = "bad_email"
+                log(f"[{idx}] {got_dom} rejected at validate")
+                time.sleep(8)
+                continue
             state = "no_post"
-            log(f"[{idx}] no POST fired - reloading")
+            log(f"[{idx}] no POST and no verdict - reloading")
             time.sleep(6)
             continue
 
