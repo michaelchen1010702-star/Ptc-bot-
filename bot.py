@@ -84,6 +84,11 @@ def safe_text(page):
         return ""
 
 
+def base_domain(host):
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
 def snap(page, tag):
     try:
         page.screenshot(path=os.path.join(DEBUG_DIR, f"{tag}.png"), full_page=True)
@@ -566,16 +571,18 @@ def submit_and_wait(page, timeout=25):
 
 
 def classify(resp):
+    """429 wins over the body - Pokemon throttles with a generic
+    {"errors":{"email":["invalid"]}} payload that is NOT a blocklist hit."""
     status = resp.get("status", 0)
     body = (resp.get("body") or "").lower()
+    if status == 429:
+        return "rate_limited"
     if status == 200 and "guid" in body:
         return "activation"
     if "not_allowed" in body:
         return "domain_blocked"
     if "invalid" in body or "exists" in body:
         return "bad_email"
-    if status == 429:
-        return "rate_limited"
     return "unknown"
 
 
@@ -650,8 +657,6 @@ def read_code_from_mail(inbox, token, page=None, timeout=150):
 # ---------------------------------------------------------------- one account
 
 def create_account(page, idx):
-    """Returns: ok, created, bad_email, blocked, rate_limited, no_post,
-    submit_failed, blank, nofields, error."""
     log(f"[{idx}] --- start ---")
 
     if not get_ready(page):
@@ -685,7 +690,7 @@ def create_account(page, idx):
     entry = None
     same_tries = 0
 
-    for attempt in range(1, 11):
+    for attempt in range(1, 15):
         if entry is None:
             entry = emailer.next_domain()
             if entry is None:
@@ -702,7 +707,6 @@ def create_account(page, idx):
             inbox, token = emailer.create_inbox(entry)
         except Exception as e:
             log(f"[{idx}] inbox fail: {e}")
-            emailer.mark_blocked(entry["domain"])
             entry = None
             continue
 
@@ -738,14 +742,14 @@ def create_account(page, idx):
             if "not_allowed" in vbody:
                 state = "domain_blocked"
                 log(f"[{idx}] {got_dom} blocklisted")
-                emailer.mark_blocked(entry["domain"])
+                emailer.mark_blocked(base_domain(got_dom))
                 entry = None
                 time.sleep(4)
                 continue
             if "invalid" in vbody or "exists" in vbody:
                 state = "bad_email"
                 log(f"[{idx}] {got_dom} rejected at validate")
-                emailer.mark_blocked(entry["domain"])
+                emailer.mark_blocked(base_domain(got_dom))
                 entry = None
                 time.sleep(4)
                 continue
@@ -765,33 +769,34 @@ def create_account(page, idx):
         if state == "activation":
             break
 
+        if state == "rate_limited":
+            same_tries += 1
+            if same_tries >= 4:
+                log(f"[{idx}] 429 x{same_tries} - trying a different address")
+                entry = None
+                time.sleep(45)
+                continue
+            wait = 45 + same_tries * 20
+            log(f"[{idx}] 429 - cooling {wait}s with a fresh session")
+            time.sleep(wait)
+            try:
+                page.context.clear_cookies()
+            except Exception:
+                pass
+            continue
+
         if state == "domain_blocked":
             log(f"[{idx}] {got_dom} blocklisted")
-            emailer.mark_blocked(entry["domain"])
+            emailer.mark_blocked(base_domain(got_dom))
             entry = None
             time.sleep(4)
             continue
 
         if state == "bad_email":
             log(f"[{idx}] {got_dom} rejected")
-            emailer.mark_blocked(entry["domain"])
+            emailer.mark_blocked(base_domain(got_dom))
             entry = None
             time.sleep(4)
-            continue
-
-        if state == "rate_limited":
-            same_tries += 1
-            if same_tries >= 3:
-                log(f"[{idx}] 429 x{same_tries} - moving to another domain")
-                entry = None
-                time.sleep(45)
-                continue
-            log(f"[{idx}] 429 - cooling 60s with a fresh session, same domain")
-            time.sleep(60)
-            try:
-                page.context.clear_cookies()
-            except Exception:
-                pass
             continue
 
         log(f"[{idx}] unknown outcome - cooling 15s")
@@ -801,14 +806,14 @@ def create_account(page, idx):
         sheet_push(row("", "", "", "error", "no inbox"))
         return "error"
 
+    if state == "rate_limited":
+        sheet_push(row(inbox, user, pwd, "rate_limited", f"domains={','.join(tried)}"))
+        return "rate_limited"
+
     if state in ("bad_email", "domain_blocked"):
         log(f"[{idx}] all domains rejected: {tried}")
         sheet_push(row(inbox, user, pwd, "bad_email", f"domains={','.join(tried)}"))
         return "bad_email"
-
-    if state == "rate_limited":
-        sheet_push(row(inbox, user, pwd, "rate_limited", f"domains={','.join(tried)}"))
-        return "rate_limited"
 
     if state == "blocked":
         sheet_push(row(inbox, user, pwd, "blocked", f"domains={','.join(tried)}"))
