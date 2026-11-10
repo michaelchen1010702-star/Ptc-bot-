@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Throwaway inbox helpers.
 
-Domain pool interleaves mail.tm / mail.gw / tempmail.lol.
-Domains without an MX record are dropped.
+tempmail.lol first, mail.tm last (its only domain is blocklisted).
+Domains rejected by Pokemon are marked and skipped.
 """
 
 import os
@@ -33,6 +33,7 @@ TEMPMAIL_CREATE = "https://api.tempmail.lol/v2/inbox/create"
 SEED_DOMAINS = [
     "marchslurp.com",
     "arcadehearth.com",
+    "roomsranked.com",
     "lucktaro.com",
     "xzcoot.com",
     "paxeluni.com",
@@ -40,6 +41,7 @@ SEED_DOMAINS = [
 ]
 
 DOMAIN_POOL = []
+BLOCKED = set()
 _pool_idx = 0
 LAST_INFO = {}
 
@@ -112,29 +114,20 @@ def sample_mailtm_domains(host, n=6):
 
 
 def prime_domains():
-    global DOMAIN_POOL, _pool_idx
-
-    tm = []
-    for d in ("marchslurp.com", "arcadehearth.com"):
-        tm.append({"domain": d, "provider": "tempmail"})
-    for d in sample_pool(3):
-        if not any(p["domain"] == d for p in tm):
-            tm.append({"domain": d, "provider": "tempmail"})
-    for d in SEED_DOMAINS:
-        if not any(p["domain"] == d for p in tm):
-            tm.append({"domain": d, "provider": "tempmail"})
-
-    mt = []
-    for host in ("api.mail.tm", "api.mail.gw"):
-        for d in sample_mailtm_domains(host, 6):
-            mt.append({"domain": d, "provider": "mailtm", "host": host})
+    global DOMAIN_POOL, _pool_idx, BLOCKED
 
     pool = []
-    for i in range(max(len(tm), len(mt))):
-        if i < len(mt):
-            pool.append(mt[i])
-        if i < len(tm):
-            pool.append(tm[i])
+    for d in ("marchslurp.com", "arcadehearth.com", "roomsranked.com"):
+        pool.append({"domain": d, "provider": "tempmail"})
+    for d in sample_pool(3):
+        if not any(p["domain"] == d for p in pool):
+            pool.append({"domain": d, "provider": "tempmail"})
+    for d in SEED_DOMAINS:
+        if not any(p["domain"] == d for p in pool):
+            pool.append({"domain": d, "provider": "tempmail"})
+    for d in sample_mailtm_domains("api.mail.tm", 5):
+        if not any(p["domain"] == d for p in pool):
+            pool.append({"domain": d, "provider": "mailtm", "host": "api.mail.tm"})
 
     kept = []
     seen = set()
@@ -149,18 +142,28 @@ def prime_domains():
         kept.append(p)
 
     DOMAIN_POOL = kept or pool
+    BLOCKED = set()
     _pool_idx = 0
     print(f"[emailer] domain pool: {[p['domain'] for p in DOMAIN_POOL]}", flush=True)
     return DOMAIN_POOL
 
 
+def mark_blocked(domain):
+    BLOCKED.add(domain)
+    print(f"[emailer] blocked: {domain}", flush=True)
+
+
 def next_domain():
+    """Next entry not yet rejected. None when the pool is exhausted."""
     global _pool_idx
     if not DOMAIN_POOL:
         return None
-    d = DOMAIN_POOL[_pool_idx % len(DOMAIN_POOL)]
-    _pool_idx += 1
-    return d
+    for _ in range(len(DOMAIN_POOL) + 1):
+        d = DOMAIN_POOL[_pool_idx % len(DOMAIN_POOL)]
+        _pool_idx += 1
+        if d["domain"] not in BLOCKED:
+            return d
+    return None
 
 
 # ---------------------------------------------------------------- tempmail.lol
@@ -228,7 +231,7 @@ def _tempmail_fetch(token):
     return out
 
 
-# ---------------------------------------------------------------- mail.tm / gw
+# ---------------------------------------------------------------- mail.tm
 
 def _mailtm_create(host, domain=None):
     if not domain:
@@ -320,12 +323,6 @@ def create_inbox(entry=None):
         return _tempmail_v1()
     except Exception as e:
         errors.append(f"v1: {e}")
-
-    for h in ("api.mail.tm", "api.mail.gw"):
-        try:
-            return _mailtm_create(h)
-        except Exception as e:
-            errors.append(f"{h}: {e}")
 
     raise RuntimeError("no inbox available | " + " ; ".join(errors[-6:]))
 
