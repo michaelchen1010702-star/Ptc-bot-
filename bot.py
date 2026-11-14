@@ -841,4 +841,105 @@ def create_account(page, idx):
         return "blocked"
 
     if state == "rate_limited":
-        sheet_push(row(inbox, user, pwd, "rate_limited", f
+        sheet_push(row(inbox, user, pwd, "rate_limited", f"domains={','.join(tried)}"))
+        return "rate_limited"
+
+    if state in ("bad_email", "domain_blocked"):
+        log(f"[{idx}] all domains rejected: {tried}")
+        sheet_push(row(inbox, user, pwd, "bad_email", f"domains={','.join(tried)}"))
+        return "bad_email"
+
+    if state == "blocked":
+        sheet_push(row(inbox, user, pwd, "blocked", f"domains={','.join(tried)}"))
+        return "blocked"
+
+    if state in ("no_post", "unknown"):
+        log(f"[{idx}] submit never produced a result ({state})")
+        snap(page, f"submitfail_{idx}")
+        sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
+        return "submit_failed"
+
+    if state != "activation":
+        snap(page, f"submitfail_{idx}")
+        sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
+        return "submit_failed"
+
+    log(f"[{idx}] account exists as {user}")
+    code = read_code_from_mail(inbox, token, page, 150)
+    log(f"[{idx}] activation code: {code}")
+    if not code:
+        snap(page, f"nocode_{idx}")
+        sheet_push(row(inbox, user, pwd, "created", f"no code | dom={got_dom}"))
+        return "created"
+
+    fill_activation(page, code)
+    time.sleep(4)
+    t = safe_text(page).lower()
+    if "thank you" in t or "activated" in t:
+        log(f"[{idx}] -> {user} [ok]")
+        sheet_push(row(inbox, user, pwd, "ok", ""))
+        return "ok"
+
+    log(f"[{idx}] code rejected")
+    snap(page, f"coderej_{idx}")
+    sheet_push(row(inbox, user, pwd, "created", "code rejected"))
+    return "created"
+
+
+# ---------------------------------------------------------------- main
+
+def launch(pw):
+    ctx = pw.chromium.launch_persistent_context(
+        user_data_dir=PROFILE_DIR,
+        channel="chrome",
+        headless=HEADLESS,
+        ignore_default_args=["--enable-automation"],
+        args=CHROME_ARGS,
+        locale="en-US",
+        timezone_id="America/Los_Angeles",
+        viewport={"width": 1440, "height": 900},
+        user_agent=UA,
+    )
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    hook_diag(page)
+    return ctx, page
+
+
+def main():
+    log(f"count={COUNT} headless={HEADLESS}")
+    emailer.prime_domains()
+
+    ok = 0
+    partial = 0
+
+    for rnd in (1, 2):
+        if ok >= COUNT:
+            break
+        log(f"=== round {rnd} ===")
+
+        with sync_playwright() as pw:
+            ctx, page = launch(pw)
+            for i in range(1, COUNT + 1):
+                try:
+                    st = create_account(page, i)
+                    if st == "ok":
+                        ok += 1
+                    elif st == "created":
+                        partial += 1
+                except Exception as e:
+                    log(f"[{i}] exception: {e}")
+                    traceback.print_exc()
+                    snap(page, f"exc_{i}")
+                time.sleep(2)
+            ctx.close()
+
+        if ok == 0 and partial == 0 and rnd == 1:
+            log("nothing created - cooling 120s then a fresh browser round")
+            time.sleep(120)
+
+    log(f"done: ok={ok} created={partial} of {COUNT}")
+    sys.exit(0 if (ok or partial) else 1)
+
+
+if __name__ == "__main__":
+    main()
