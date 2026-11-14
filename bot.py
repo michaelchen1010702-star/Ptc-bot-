@@ -510,26 +510,21 @@ def ensure_recaptcha(page, patience=25):
 
 
 def prewarm_api(page):
-    try:
-        cookies = page.context.cookies(API_URL)
-        log(f"api cookies before: {[c['name'] for c in cookies]}")
-    except Exception:
-        pass
-
+    """Rebuild Imperva cookies for the api host."""
     try:
         p2 = page.context.new_page()
         p2.goto(API_URL, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(4)
-        log(f"api prewarm text: {safe_text(p2)[:120]}")
+        time.sleep(5)
         p2.close()
     except Exception as e:
         log(f"api prewarm err: {e}")
 
     try:
-        cookies = page.context.cookies(API_URL)
-        log(f"api cookies after: {[c['name'] for c in cookies]}")
+        names = [c["name"] for c in page.context.cookies(API_URL)]
+        log(f"api cookies: {names}")
+        return "reese84" in names
     except Exception:
-        pass
+        return False
 
 
 # ---------------------------------------------------------------- submit
@@ -571,10 +566,12 @@ def submit_and_wait(page, timeout=25):
 
 
 def classify(resp):
-    """429 wins over the body - Pokemon throttles with a generic
-    {"errors":{"email":["invalid"]}} payload that is NOT a blocklist hit."""
+    """403/errorCode = Imperva block. 429 = throttle (its body also says
+    "invalid", which is why 429 must be checked before the body)."""
     status = resp.get("status", 0)
     body = (resp.get("body") or "").lower()
+    if status == 403 or "errorcode" in body:
+        return "imperva_block"
     if status == 429:
         return "rate_limited"
     if status == 200 and "guid" in body:
@@ -587,7 +584,7 @@ def classify(resp):
 
 
 def back_to_form(page):
-    """Always a full reload so no stale error state survives."""
+    """Full reload so no stale error state survives."""
     goto(page, JOIN_URL)
     if not wait_for_ready(page, 45):
         return False
@@ -679,7 +676,10 @@ def create_account(page, idx):
         return "nofields"
 
     ensure_recaptcha(page)
-    prewarm_api(page)
+    if not prewarm_api(page):
+        log(f"[{idx}] api host has no reese84 - waiting 30s and retrying prewarm")
+        time.sleep(30)
+        prewarm_api(page)
 
     user = rand_user()
     pwd = rand_pass()
@@ -689,8 +689,9 @@ def create_account(page, idx):
     tried = []
     entry = None
     same_tries = 0
+    imperva_hits = 0
 
-    for attempt in range(1, 15):
+    for attempt in range(1, 11):
         if entry is None:
             entry = emailer.next_domain()
             if entry is None:
@@ -702,6 +703,7 @@ def create_account(page, idx):
             if not back_to_form(page):
                 log(f"[{idx}] lost the form")
                 break
+            time.sleep(10)
 
         try:
             inbox, token = emailer.create_inbox(entry)
@@ -727,8 +729,8 @@ def create_account(page, idx):
 
         if outcome == "blocked":
             state = "blocked"
-            log(f"[{idx}] imperva block - cooling 30s")
-            time.sleep(30)
+            log(f"[{idx}] imperva page block - cooling 40s")
+            time.sleep(40)
             continue
 
         if outcome == "activation":
@@ -739,23 +741,39 @@ def create_account(page, idx):
             v = (NET["validate"] or [{}])[-1]
             vbody = (v.get("body") or "").lower()
             log(f"  validate body: {vbody[:160]}")
+            if "errorcode" in vbody or "blocked by our security" in vbody:
+                state = "imperva_block"
+                imperva_hits += 1
+                log(f"[{idx}] imperva 403 at validate - cooling 75s, re-warming")
+                time.sleep(75)
+                try:
+                    page.context.clear_cookies()
+                except Exception:
+                    pass
+                if not back_to_form(page):
+                    break
+                prewarm_api(page)
+                if imperva_hits >= 4:
+                    log(f"[{idx}] 4 imperva blocks - stopping")
+                    break
+                continue
             if "not_allowed" in vbody:
                 state = "domain_blocked"
                 log(f"[{idx}] {got_dom} blocklisted")
                 emailer.mark_blocked(base_domain(got_dom))
                 entry = None
-                time.sleep(4)
+                time.sleep(5)
                 continue
             if "invalid" in vbody or "exists" in vbody:
                 state = "bad_email"
                 log(f"[{idx}] {got_dom} rejected at validate")
                 emailer.mark_blocked(base_domain(got_dom))
                 entry = None
-                time.sleep(4)
+                time.sleep(5)
                 continue
             state = "no_post"
             log(f"[{idx}] no POST and no verdict - reloading")
-            time.sleep(6)
+            time.sleep(8)
             continue
 
         resp = NET["create_user"][-1]
@@ -769,143 +787,58 @@ def create_account(page, idx):
         if state == "activation":
             break
 
-        if state == "rate_limited":
-            same_tries += 1
-            if same_tries >= 4:
-                log(f"[{idx}] 429 x{same_tries} - trying a different address")
-                entry = None
-                time.sleep(45)
-                continue
-            wait = 45 + same_tries * 20
-            log(f"[{idx}] 429 - cooling {wait}s with a fresh session")
-            time.sleep(wait)
+        if state == "imperva_block":
+            imperva_hits += 1
+            log(f"[{idx}] imperva 403 - cooling 75s, clearing cookies, re-warming")
+            time.sleep(75)
             try:
                 page.context.clear_cookies()
             except Exception:
                 pass
+            if not back_to_form(page):
+                break
+            prewarm_api(page)
+            if imperva_hits >= 4:
+                log(f"[{idx}] 4 imperva blocks - stopping")
+                break
+            continue
+
+        if state == "rate_limited":
+            same_tries += 1
+            if same_tries >= 3:
+                log(f"[{idx}] 429 x{same_tries} - trying a different address")
+                entry = None
+                time.sleep(30)
+                continue
+            wait = 40 + same_tries * 20
+            log(f"[{idx}] 429 - cooling {wait}s")
+            time.sleep(wait)
             continue
 
         if state == "domain_blocked":
             log(f"[{idx}] {got_dom} blocklisted")
             emailer.mark_blocked(base_domain(got_dom))
             entry = None
-            time.sleep(4)
+            time.sleep(5)
             continue
 
         if state == "bad_email":
             log(f"[{idx}] {got_dom} rejected")
             emailer.mark_blocked(base_domain(got_dom))
             entry = None
-            time.sleep(4)
+            time.sleep(5)
             continue
 
-        log(f"[{idx}] unknown outcome - cooling 15s")
-        time.sleep(15)
+        log(f"[{idx}] unknown outcome - cooling 20s")
+        time.sleep(20)
 
     if not inbox:
         sheet_push(row("", "", "", "error", "no inbox"))
         return "error"
 
-    if state == "rate_limited":
-        sheet_push(row(inbox, user, pwd, "rate_limited", f"domains={','.join(tried)}"))
-        return "rate_limited"
-
-    if state in ("bad_email", "domain_blocked"):
-        log(f"[{idx}] all domains rejected: {tried}")
-        sheet_push(row(inbox, user, pwd, "bad_email", f"domains={','.join(tried)}"))
-        return "bad_email"
-
-    if state == "blocked":
-        sheet_push(row(inbox, user, pwd, "blocked", f"domains={','.join(tried)}"))
+    if state == "imperva_block":
+        sheet_push(row(inbox, user, pwd, "blocked", f"imperva 403 | {','.join(tried)}"))
         return "blocked"
 
-    if state in ("no_post", "unknown"):
-        log(f"[{idx}] submit never produced a result ({state})")
-        snap(page, f"submitfail_{idx}")
-        sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
-        return "submit_failed"
-
-    if state != "activation":
-        snap(page, f"submitfail_{idx}")
-        sheet_push(row(inbox, user, pwd, "submit_failed", f"state={state}"))
-        return "submit_failed"
-
-    log(f"[{idx}] account exists as {user}")
-    code = read_code_from_mail(inbox, token, page, 150)
-    log(f"[{idx}] activation code: {code}")
-    if not code:
-        snap(page, f"nocode_{idx}")
-        sheet_push(row(inbox, user, pwd, "created", f"no code | dom={got_dom}"))
-        return "created"
-
-    fill_activation(page, code)
-    time.sleep(4)
-    t = safe_text(page).lower()
-    if "thank you" in t or "activated" in t:
-        log(f"[{idx}] -> {user} [ok]")
-        sheet_push(row(inbox, user, pwd, "ok", ""))
-        return "ok"
-
-    log(f"[{idx}] code rejected")
-    snap(page, f"coderej_{idx}")
-    sheet_push(row(inbox, user, pwd, "created", "code rejected"))
-    return "created"
-
-
-# ---------------------------------------------------------------- main
-
-def launch(pw):
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=PROFILE_DIR,
-        channel="chrome",
-        headless=HEADLESS,
-        ignore_default_args=["--enable-automation"],
-        args=CHROME_ARGS,
-        locale="en-US",
-        timezone_id="America/Los_Angeles",
-        viewport={"width": 1440, "height": 900},
-        user_agent=UA,
-    )
-    page = ctx.pages[0] if ctx.pages else ctx.new_page()
-    hook_diag(page)
-    return ctx, page
-
-
-def main():
-    log(f"count={COUNT} headless={HEADLESS}")
-    emailer.prime_domains()
-
-    ok = 0
-    partial = 0
-
-    for rnd in (1, 2):
-        if ok >= COUNT:
-            break
-        log(f"=== round {rnd} ===")
-
-        with sync_playwright() as pw:
-            ctx, page = launch(pw)
-            for i in range(1, COUNT + 1):
-                try:
-                    st = create_account(page, i)
-                    if st == "ok":
-                        ok += 1
-                    elif st == "created":
-                        partial += 1
-                except Exception as e:
-                    log(f"[{i}] exception: {e}")
-                    traceback.print_exc()
-                    snap(page, f"exc_{i}")
-                time.sleep(2)
-            ctx.close()
-
-        if ok == 0 and partial == 0 and rnd == 1:
-            log("nothing created - cooling 90s then a fresh browser round")
-            time.sleep(90)
-
-    log(f"done: ok={ok} created={partial} of {COUNT}")
-    sys.exit(0 if (ok or partial) else 1)
-
-
-if __name__ == "__main__":
-    main()
+    if state == "rate_limited":
+        sheet_push(row(inbox, user, pwd, "rate_limited", f
